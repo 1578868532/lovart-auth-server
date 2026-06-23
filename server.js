@@ -285,6 +285,11 @@ async function fetchLatestOtp(targetEmail) {
     finally { otpFetchLocks.delete(lockKey); }
 }
 
+app.use((req, res, next) => {
+  console.log('[REQ]', req.method, req.path, req.query || {});
+  next();
+});
+
 app.get('/api/health', (req, res) => {
     res.json({ success: true, message: 'auth server running', time: now() });
 });
