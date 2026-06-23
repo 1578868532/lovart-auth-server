@@ -76,6 +76,43 @@ function requireAdmin(req, res) {
 }
 
 function getLicenseForSession(req) {
+    const body = req.body || {};
+
+    // 支持 local-lv2 模式（Electron 本地卡密，无 sessionToken）
+    if (body.licenseMode === 'local-lv2') {
+        const licenseKey = String(body.licenseKey || '').trim();
+        const machineId = String(body.machineId || '').trim();
+        if (!licenseKey || !machineId) return { error: '缺少授权信息' };
+        if (!licenseKey.startsWith('LV2.')) return { error: 'license_invalid' };
+
+        try {
+            const parts = licenseKey.split('.');
+            if (parts.length !== 3) return { error: 'license_invalid' };
+
+            // base64url decode payload（不验证签名，仅解析）
+            const normalized = parts[1].replace(/-/g, '+').replace(/_/g, '/');
+            const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4);
+            const payloadBytes = Buffer.from(padded, 'base64');
+            const payload = JSON.parse(payloadBytes.toString('utf8'));
+
+            if (String(payload.machineId) !== machineId) return { error: 'license_invalid' };
+            if (!Number.isFinite(Number(payload.expire)) || Number(payload.expire) <= now()) {
+                return { error: 'license_invalid' };
+            }
+
+            return {
+                licenseMode: 'local-lv2',
+                machineId,
+                licenseKey,
+                rateLimitKey: machineId,
+                expire_at: Number(payload.expire)
+            };
+        } catch (e) {
+            return { error: 'license_invalid' };
+        }
+    }
+
+    // 原有 session 模式
     const authorization = String(req.headers.authorization || '');
     const sessionToken = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
     const machineId = String(req.headers['x-machine-id'] || '').trim();
@@ -88,7 +125,7 @@ function getLicenseForSession(req) {
     const license = db.licenses.find(item => item.licenseKey === session.licenseKey);
     if (!license || license.status !== 'active') return { error: '授权已失效' };
     if (now() > Number(license.expire_at) || now() > Number(session.expire_at)) return { error: '授权已过期' };
-    return { db, session, license, sessionToken, machineId };
+    return { db, session, license, sessionToken, machineId, rateLimitKey: sessionToken };
 }
 
 function requireLicenseSession(req, res) {
@@ -379,7 +416,7 @@ app.post('/api/verify', (req, res) => {
 app.post('/api/otp/mark-baseline', async (req, res) => {
     const auth = requireLicenseSession(req, res);
     if (!auth) return;
-    if (!allowOtpRequest(auth.sessionToken)) return res.status(429).json({ success: false, error: '请求过于频繁' });
+    if (!allowOtpRequest(auth.rateLimitKey)) return res.status(429).json({ success: false, error: '请求过于频繁' });
     const targetEmail = normalizeTargetEmail(req.body && req.body.targetEmail);
     if (targetEmail === null) return res.status(400).json({ success: false, error: '目标邮箱格式无效' });
 
@@ -394,7 +431,7 @@ app.post('/api/otp/mark-baseline', async (req, res) => {
 app.post('/api/otp/get', async (req, res) => {
     const auth = requireLicenseSession(req, res);
     if (!auth) return;
-    if (!allowOtpRequest(auth.sessionToken)) return res.status(429).json({ success: false, error: '请求过于频繁' });
+    if (!allowOtpRequest(auth.rateLimitKey)) return res.status(429).json({ success: false, error: '请求过于频繁' });
     const targetEmail = normalizeTargetEmail(req.body && req.body.targetEmail);
     if (targetEmail === null) return res.status(400).json({ success: false, error: '目标邮箱格式无效' });
 
