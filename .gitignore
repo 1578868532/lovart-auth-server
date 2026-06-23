@@ -1,0 +1,7 @@
+node_modules/
+.env
+db.json
+data/
+.private-backup/
+auth.db
+*.log
