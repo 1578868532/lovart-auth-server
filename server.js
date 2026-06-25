@@ -77,6 +77,27 @@ function createLicenseKey() {
     return `LV-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
 }
 
+const LICENSE_PRIVATE_KEY = process.env.LICENSE_PRIVATE_KEY
+    ? crypto.createPrivateKey(process.env.LICENSE_PRIVATE_KEY.replace(/\\n/g, '\n'))
+    : null;
+const LICENSE_PUBLIC_KEY = crypto.createPublicKey(
+    '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAJVmR7Yrj3zh/GDV9txERvI/v/9UI7w/4k/pR7n/tHlc=\n-----END PUBLIC KEY-----'
+);
+
+function createLV3LicenseKey(plan, expireAt) {
+    if (!LICENSE_PRIVATE_KEY) throw new Error('LICENSE_PRIVATE_KEY not set');
+    const payload = {
+        kid: crypto.randomBytes(4).toString('hex'),
+        machineId: 'UNBOUND',
+        expire: expireAt,
+        plan: plan,
+        hasGift: plan === 'permanent'
+    };
+    const payloadB64 = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    const sig = crypto.sign(null, Buffer.from(payloadB64), LICENSE_PRIVATE_KEY);
+    return 'LV3.' + payloadB64 + '.' + sig.toString('base64url');
+}
+
 function requireAdmin(req, res) {
     if (!ADMIN_SECRET) {
         res.status(503).json({ success: false, message: 'ADMIN_SECRET is not configured' });
@@ -93,22 +114,26 @@ function requireAdmin(req, res) {
 function getLicenseForSession(req) {
     const body = req.body || {};
 
-    // 支持 local-lv2 模式（Electron 本地卡密，无 sessionToken）
+    // 支持 Electron 本地卡密模式（LV2/LV3，无 sessionToken）
     if (body.licenseMode === 'local-lv2') {
         const licenseKey = String(body.licenseKey || '').trim();
         const machineId = String(body.machineId || '').trim();
         if (!licenseKey || !machineId) return { error: '缺少授权信息' };
-        if (!licenseKey.startsWith('LV2.')) return { error: 'license_invalid' };
+        if (!licenseKey.startsWith('LV2.') && !licenseKey.startsWith('LV3.')) return { error: 'license_invalid' };
 
         try {
             const parts = licenseKey.split('.');
             if (parts.length !== 3) return { error: 'license_invalid' };
 
-            // base64url decode payload（不验证签名，仅解析）
-            const normalized = parts[1].replace(/-/g, '+').replace(/_/g, '/');
-            const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4);
-            const payloadBytes = Buffer.from(padded, 'base64');
-            const payload = JSON.parse(payloadBytes.toString('utf8'));
+            // Ed25519 签名验证
+            const payloadB64 = parts[1];
+            const sig = Buffer.from(parts[2], 'base64url');
+            const payloadBytes = Buffer.from(Buffer.from(payloadB64, 'base64url').toString('utf8'), 'utf8');
+            const valid = crypto.verify(null, payloadBytes, LICENSE_PUBLIC_KEY, sig) ||
+                crypto.verify(null, Buffer.from(payloadB64), LICENSE_PUBLIC_KEY, sig);
+            if (!valid) return { error: 'license_invalid' };
+
+            const payload = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8'));
 
             if (String(payload.machineId) !== machineId) return { error: 'license_invalid' };
             if (!Number.isFinite(Number(payload.expire)) || Number(payload.expire) <= now()) {
@@ -384,7 +409,7 @@ app.get('/api/health', (req, res) => {
 
 app.post('/api/admin/create-license', (req, res) => {
     if (!requireAdmin(req, res)) return;
-    const days = Number(req.body && req.body.days || 30);
+    const days = Math.min(Number(req.body && req.body.days || 30), 365);
     const maxSlots = Number(req.body && req.body.maxSlots || 3);
     const maxAccounts = Number(req.body && req.body.maxAccounts || 100);
     const plan = String(req.body && req.body.plan || 'monthly').trim() || 'monthly';
@@ -393,8 +418,14 @@ app.post('/api/admin/create-license', (req, res) => {
     }
 
     const db = loadDB();
-    let licenseKey = createLicenseKey();
-    while (db.licenses.some(license => license.licenseKey === licenseKey)) licenseKey = createLicenseKey();
+    let licenseKey;
+    const expireAt = now() + days * 86400000;
+    if (LICENSE_PRIVATE_KEY) {
+        licenseKey = createLV3LicenseKey(plan, expireAt);
+    } else {
+        licenseKey = createLicenseKey();
+        while (db.licenses.some(l => l.licenseKey === licenseKey)) licenseKey = createLicenseKey();
+    }
     const license = {
         licenseKey,
         plan,
@@ -504,6 +535,125 @@ app.post('/api/verify', (req, res) => {
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
+});
+
+// ==================== 公共工具：生成账号批次 ====================
+const DOMAIN_POOL = 'yxd.ccwu.cc, haitai.cc.cd, shupianduizhang.cc.cd, ylian.ccwu.cc'.split(/[\n,]+/).map(d => d.trim()).filter(d => d.length > 0);
+
+function generateAccountBatch(count) {
+    const accounts = [];
+    for (let i = 0; i < count; i++) {
+        const prefix = Date.now().toString(36) + crypto.randomBytes(2).toString('hex');
+        const randomDomain = DOMAIN_POOL[Math.floor(Math.random() * DOMAIN_POOL.length)];
+        accounts.push({ email: prefix + '@' + randomDomain, password: '' });
+    }
+    return accounts;
+}
+
+// ==================== 接口 3: 客户端账号拉取/刷新 ====================
+app.post('/api', (req, res, next) => {
+    const action = req.query.action;
+
+    // --- 自动拉取（激活时首次下发） ---
+    if (action === 'auto_fetch') {
+        const licenseKey = String(req.body && req.body.licenseKey || '').trim();
+        const machineId = String(req.body && req.body.machineId || '').trim();
+
+        if (!licenseKey || (!licenseKey.startsWith('LV2.') && !licenseKey.startsWith('LV3.'))) {
+            return res.status(400).json({ success: false, message: '无效的卡密' });
+        }
+
+        let payload = {};
+        try {
+            const parts = licenseKey.split('.');
+            if (parts.length === 2) { // LV2
+                payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+            } else if (parts.length === 3) { // LV3
+                payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+            }
+        } catch (e) {
+            return res.status(400).json({ success: false, message: '卡密解析失败' });
+        }
+
+        const db = loadDB();
+        const license = db.licenses.find(item => item.licenseKey === licenseKey);
+        if (!license || license.status !== 'active') {
+            return res.status(403).json({ success: false, message: '卡密无效或已被封禁' });
+        }
+        if (now() > Number(license.expire_at)) {
+            return res.status(403).json({ success: false, message: '卡密已过期' });
+        }
+
+        let count = payload.plan === 'monthly' ? 50 : (payload.plan === 'permanent' ? 100 : 10);
+        const accounts = generateAccountBatch(count);
+
+        // 记录配额
+        db.refresh_records = db.refresh_records || [];
+        db.refresh_records.push({ licenseKey, machineId, date: new Date().toISOString().split('T')[0], count, type: 'initial' });
+        saveDB(db);
+
+        console.log('[auto-fetch] license=' + licenseKey.substring(0, 12) + '... plan=' + payload.plan + ' count=' + count);
+        return res.json({ success: true, count, accounts });
+    }
+
+    // --- 每日刷新（补满配额） ---
+    if (action === 'refresh_accounts') {
+        const licenseKey = String(req.body && req.body.licenseKey || '').trim();
+        const machineId = String(req.body && req.body.machineId || '').trim();
+        const deletedCount = parseInt(req.body && req.body.deletedCount, 10) || 0;
+
+        const db = loadDB();
+
+        // 验证卡密
+        let payload = {};
+        try {
+            const parts = licenseKey.split('.');
+            if (licenseKey.startsWith('LV2.') && parts.length === 2) {
+                payload = JSON.parse(Buffer.from(parts[1], 'base64').toString('utf8'));
+            } else if (licenseKey.startsWith('LV3.') && parts.length === 3) {
+                payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+            }
+        } catch (e) {}
+
+        const license = db.licenses.find(item => item.licenseKey === licenseKey);
+        if (!license || license.status !== 'active') {
+            return res.status(403).json({ success: false, message: '卡密无效或已被封禁' });
+        }
+        if (now() > Number(license.expire_at)) {
+            return res.status(403).json({ success: false, message: '卡密已过期' });
+        }
+
+        // 每日限制：同一卡密同一天只能刷新一次
+        db.refresh_records = db.refresh_records || [];
+        const today = new Date().toISOString().split('T')[0];
+        const todayRefreshes = db.refresh_records.filter(r => r.licenseKey === licenseKey && r.machineId === machineId && r.date === today && r.type === 'refresh');
+        if (todayRefreshes.length > 0) {
+            return res.status(429).json({ success: false, message: '今日已刷新，请明天再试' });
+        }
+
+        // 总配额限制：累计下发不超过套餐上限
+        const plan = payload.plan || license.plan || 'trial';
+        const quota = plan === 'monthly' ? 50 : (plan === 'permanent' ? 100 : 10);
+        const totalSent = db.refresh_records.filter(r => r.licenseKey === licenseKey && r.machineId === machineId).reduce((sum, r) => sum + (r.count || 0), 0);
+        const remaining = Math.max(0, quota - totalSent);
+
+        if (remaining <= 0) {
+            return res.status(429).json({ success: false, message: '已达到套餐总配额上限（' + quota + ' 个），无法继续补号' });
+        }
+
+        // 补号数量 = min(删除数, 剩余配额)
+        const fillCount = Math.min(Math.max(deletedCount, 1), remaining);
+        const accounts = generateAccountBatch(fillCount);
+
+        db.refresh_records.push({ licenseKey, machineId, date: today, count: fillCount, type: 'refresh' });
+        saveDB(db);
+
+        console.log('[refresh-accounts] license=' + licenseKey.substring(0, 12) + '... filled=' + fillCount + ' remaining=' + (remaining - fillCount));
+        return res.json({ success: true, count: fillCount, accounts });
+    }
+
+    // 其他 action 透传
+    return next();
 });
 
 app.post('/api/otp/mark-baseline', async (req, res) => {
