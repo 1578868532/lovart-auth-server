@@ -69,6 +69,15 @@ function now() {
     return Date.now();
 }
 
+function refreshDateKey(time = Date.now()) {
+    return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Shanghai',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).format(new Date(time));
+}
+
 function createToken() {
     return crypto.randomBytes(32).toString('hex');
 }
@@ -623,17 +632,12 @@ app.post('/api', (req, res, next) => {
             return res.status(403).json({ success: false, message: '卡密已过期' });
         }
 
-        // 严格限制：同一卡密同设备每 24 小时只能手动刷新一次
+        // 严格限制：同一卡密同设备按北京时间自然日只能手动刷新一次
         db.refresh_records = db.refresh_records || [];
-        const today = new Date().toISOString().split('T')[0];
-        const lastRefresh = db.refresh_records
-            .filter(r => r.licenseKey === licenseKey && r.machineId === machineId && r.type === 'refresh')
-            .sort((a, b) => Number(b.createdAt || b.updatedAt || 0) - Number(a.createdAt || a.updatedAt || 0))[0];
-        const lastRefreshAt = Number(lastRefresh && (lastRefresh.createdAt || lastRefresh.updatedAt));
-        const legacySameDayRefresh = lastRefresh && !lastRefreshAt && lastRefresh.date === today;
-        if ((lastRefreshAt && now() - lastRefreshAt < 24 * 60 * 60 * 1000) || legacySameDayRefresh) {
-            const nextRefreshAt = lastRefreshAt ? lastRefreshAt + 24 * 60 * 60 * 1000 : Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate() + 1);
-            return res.status(429).json({ success: false, message: '24 小时内已刷新，请倒计时结束后再试', nextRefreshAt });
+        const today = refreshDateKey();
+        const todayRefreshes = db.refresh_records.filter(r => r.licenseKey === licenseKey && r.machineId === machineId && r.date === today && r.type === 'refresh');
+        if (todayRefreshes.length > 0) {
+            return res.status(429).json({ success: false, message: '今日已补号，请明天 00:00 后再试', refreshUsedToday: true });
         }
 
         // 总配额限制：累计下发不超过套餐上限
