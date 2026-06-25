@@ -623,12 +623,17 @@ app.post('/api', (req, res, next) => {
             return res.status(403).json({ success: false, message: '卡密已过期' });
         }
 
-        // 每日限制：同一卡密同一天只能刷新一次
+        // 严格限制：同一卡密同设备每 24 小时只能手动刷新一次
         db.refresh_records = db.refresh_records || [];
         const today = new Date().toISOString().split('T')[0];
-        const todayRefreshes = db.refresh_records.filter(r => r.licenseKey === licenseKey && r.machineId === machineId && r.date === today && r.type === 'refresh');
-        if (todayRefreshes.length > 0) {
-            return res.status(429).json({ success: false, message: '今日已刷新，请明天再试' });
+        const lastRefresh = db.refresh_records
+            .filter(r => r.licenseKey === licenseKey && r.machineId === machineId && r.type === 'refresh')
+            .sort((a, b) => Number(b.createdAt || b.updatedAt || 0) - Number(a.createdAt || a.updatedAt || 0))[0];
+        const lastRefreshAt = Number(lastRefresh && (lastRefresh.createdAt || lastRefresh.updatedAt));
+        const legacySameDayRefresh = lastRefresh && !lastRefreshAt && lastRefresh.date === today;
+        if ((lastRefreshAt && now() - lastRefreshAt < 24 * 60 * 60 * 1000) || legacySameDayRefresh) {
+            const nextRefreshAt = lastRefreshAt ? lastRefreshAt + 24 * 60 * 60 * 1000 : Date.UTC(new Date().getUTCFullYear(), new Date().getUTCMonth(), new Date().getUTCDate() + 1);
+            return res.status(429).json({ success: false, message: '24 小时内已刷新，请倒计时结束后再试', nextRefreshAt });
         }
 
         // 总配额限制：累计下发不超过套餐上限
@@ -645,7 +650,7 @@ app.post('/api', (req, res, next) => {
         const fillCount = Math.min(Math.max(deletedCount, 1), remaining);
         const accounts = generateAccountBatch(fillCount);
 
-        db.refresh_records.push({ licenseKey, machineId, date: today, count: fillCount, type: 'refresh' });
+        db.refresh_records.push({ licenseKey, machineId, date: today, count: fillCount, type: 'refresh', createdAt: now() });
         saveDB(db);
 
         console.log('[refresh-accounts] license=' + licenseKey.substring(0, 12) + '... filled=' + fillCount + ' remaining=' + (remaining - fillCount));
