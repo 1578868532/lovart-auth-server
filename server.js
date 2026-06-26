@@ -21,8 +21,8 @@ const OTP_RATE_WINDOW_MS = 60 * 1000;
 const OTP_SESSION_TTL_MS = Number(process.env.OTP_SESSION_TTL_MS || 5 * 60 * 1000);
 const OTP_BUFFER_MAX_AGE_MS = Number(process.env.OTP_BUFFER_MAX_AGE_MS || 10 * 60 * 1000);
 const OTP_BUFFER_MAX_SIZE = Number(process.env.OTP_BUFFER_MAX_SIZE || 200);
-const IMAP_POLL_INTERVAL_MS = Number(process.env.IMAP_POLL_INTERVAL_MS || 2500);
-const IMAP_SCAN_LIMIT = Number(process.env.IMAP_SCAN_LIMIT || 100);
+const IMAP_POLL_INTERVAL_MS = Number(process.env.IMAP_POLL_INTERVAL_MS || 1500);
+const IMAP_SCAN_LIMIT = Number(process.env.IMAP_SCAN_LIMIT || 35);
 const LOCK_TTL_MS = Number(process.env.OTP_LOCK_TTL_MS || 1000);
 
 // Worker 层凭证（仅存在于此文件，不暴露到 API 层）
@@ -32,6 +32,7 @@ const WORKER_PASS = String(process.env.OTP_PASS || '').trim();
 // === 抗并发 OTP 系统 ===
 // OTP Session Store: sessionKey → { email, machineId, requestId, code, createdAt, used, status }
 const otpStore = new Map();
+const otpBaselines = new Map();
 // Inbox Buffer: [{ to, text, code, timestamp, messageId, used }]
 const inboxBuffer = [];
 // Processing Lock: `${email}_${machineId}` → { time }
@@ -380,14 +381,35 @@ function startImapWorker() {
 
 // === OTP 匹配与消费 ===
 
-function matchOTP(email) {
+function otpBaselineKey(email, machineId) {
+    return `${email || 'global'}_${machineId || 'global'}`;
+}
+
+function setOtpBaseline(email, machineId) {
+    otpBaselines.set(otpBaselineKey(email, machineId), now());
+}
+
+function getOtpBaseline(email, machineId) {
+    return otpBaselines.get(otpBaselineKey(email, machineId)) || 0;
+}
+
+function cleanupOtpBaselines() {
+    const expired = now() - OTP_BUFFER_MAX_AGE_MS;
+    for (const [key, timestamp] of otpBaselines) {
+        if (timestamp < expired) otpBaselines.delete(key);
+    }
+}
+
+function matchOTP(email, machineId) {
     const fiveMinAgo = now() - OTP_BUFFER_MAX_AGE_MS;
+    const baselineAt = getOtpBaseline(email, machineId);
 
     // 从最新往旧找，返回第一个未使用的匹配项
     for (let i = inboxBuffer.length - 1; i >= 0; i--) {
         const item = inboxBuffer[i];
         if (item.used) continue;
         if (item.timestamp < fiveMinAgo) continue;
+        if (baselineAt && item.timestamp < baselineAt) continue;
 
         // 优先用 To 字段精确匹配
         if (email && item.to === email) return item;
@@ -416,6 +438,7 @@ function cleanupOtpStore() {
             otpStore.delete(key);
         }
     }
+    cleanupOtpBaselines();
 }
 
 // === 并发锁 ===
@@ -711,10 +734,7 @@ app.post('/api/otp/mark-baseline', async (req, res) => {
     if (targetEmail === null) return res.status(400).json({ success: false, status: 'error', error: '目标邮箱格式无效' });
 
     try {
-        // 触发一次 IMAP 轮询，捕获当前邮件状态
-        await imapPollWorker({ force: true });
-
-        // 将当前 buffer 中该邮箱的所有验证码标记为已使用（建立基线）
+        setOtpBaseline(targetEmail, auth.machineId);
         for (const item of inboxBuffer) {
             if (!item.used && (item.to === targetEmail || (targetEmail && item.text.includes(targetEmail)))) {
                 item.used = true;
@@ -780,7 +800,7 @@ app.post('/api/otp/get', async (req, res) => {
     }
 
     // 从 inboxBuffer 匹配验证码
-    const matched = matchOTP(targetEmail);
+    const matched = matchOTP(targetEmail, machineId);
     if (matched) {
         consumeOTP(matched);
         const session = otpStore.get(sessionKey);
@@ -797,7 +817,7 @@ app.post('/api/otp/get', async (req, res) => {
     const lockKey = `${targetEmail || 'global'}_${machineId}`;
     if (acquireLock(lockKey)) {
         await imapPollWorker({ force: true });
-        const matchedAfterPoll = matchOTP(targetEmail);
+        const matchedAfterPoll = matchOTP(targetEmail, machineId);
         if (matchedAfterPoll) {
             consumeOTP(matchedAfterPoll);
             const session = otpStore.get(sessionKey);
