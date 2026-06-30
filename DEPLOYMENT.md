@@ -13,6 +13,8 @@ Set ALL of the following in Render → Environment (never commit real values to 
 | `OTP_IMAP_HOST` | `imap.163.com` | |
 | `OTP_IMAP_PORT` | `993` | |
 | `OTP_IMAP_SECURE` | `true` | |
+| `OTP_IMAP_USE_PROXY` | `false` | Optional. Set to `true` only if the mail server must be reached through a proxy |
+| `OTP_IMAP_PROXY_SERVER` | empty | Optional. ImapFlow proxy URL, e.g. `socks5://host:port` or `http://host:port` |
 | `DATA_DIR` | persistent disk mount path | e.g. `/var/data`. `db.json` will be written here |
 
 **WARNING:** If `NODE_ENV` is not set to `production`, the server will start a local dev-only admin secret that must NOT be used in production. Always set `NODE_ENV=production` on Render.

@@ -28,6 +28,8 @@ const LOCK_TTL_MS = Number(process.env.OTP_LOCK_TTL_MS || 1000);
 // Worker 层凭证（仅存在于此文件，不暴露到 API 层）
 const WORKER_EMAIL = String(process.env.OTP_EMAIL || '').trim();
 const WORKER_PASS = String(process.env.OTP_PASS || '').trim();
+const OTP_IMAP_USE_PROXY = String(process.env.OTP_IMAP_USE_PROXY || 'false').toLowerCase() === 'true';
+const OTP_IMAP_PROXY_SERVER = String(process.env.OTP_IMAP_PROXY_SERVER || '').trim();
 
 // === 抗并发 OTP 系统 ===
 // OTP Session Store: sessionKey → { email, machineId, requestId, code, createdAt, used, status }
@@ -266,13 +268,17 @@ function extractOtpCode(parsed) {
 
 async function openOtpMailbox() {
     if (!WORKER_EMAIL || !WORKER_PASS) throw new Error('worker credentials not configured');
-    const client = new ImapFlow({
+    const imapOptions = {
         host: process.env.OTP_IMAP_HOST || 'imap.163.com',
         port: Number(process.env.OTP_IMAP_PORT) || 993,
         secure: String(process.env.OTP_IMAP_SECURE || 'true').toLowerCase() !== 'false',
         auth: { user: WORKER_EMAIL, pass: WORKER_PASS },
         logger: false
-    });
+    };
+    if (OTP_IMAP_USE_PROXY && OTP_IMAP_PROXY_SERVER) {
+        imapOptions.proxy = OTP_IMAP_PROXY_SERVER;
+    }
+    const client = new ImapFlow(imapOptions);
     await client.connect();
     await client.mailboxOpen('INBOX');
     return client;
@@ -654,7 +660,8 @@ app.post('/api', (req, res, next) => {
             return res.status(403).json({ success: false, message: '卡密已过期' });
         }
 
-        let count = payload.plan === 'monthly' ? 50 : (payload.plan === 'permanent' ? 100 : 10);
+        let count = payload.plan === 'permanent' ? 0 : (payload.plan === 'monthly' ? 50 : 10);
+        if (count <= 0) return res.json({ success: true, count: 0, accounts: [], message: '永久卡不携带云端账号，请手动导入账号' });
         const accounts = generateAccountBatch(count);
 
         // 记录配额
@@ -703,7 +710,8 @@ app.post('/api', (req, res, next) => {
 
         // 总配额限制：累计下发不超过套餐上限
         const plan = payload.plan || license.plan || 'trial';
-        const quota = plan === 'monthly' ? 50 : (plan === 'permanent' ? 100 : 10);
+        if (plan === 'permanent') return res.status(403).json({ success: false, message: '永久卡不支持云端补号，请手动导入账号' });
+        const quota = plan === 'monthly' ? 50 : 10;
         const totalSent = db.refresh_records.filter(r => r.licenseKey === licenseKey && r.machineId === machineId).reduce((sum, r) => sum + (r.count || 0), 0);
         const remaining = Math.max(0, quota - totalSent);
 
