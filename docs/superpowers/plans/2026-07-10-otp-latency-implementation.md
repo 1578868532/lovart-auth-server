@@ -142,7 +142,6 @@ git commit -m "feat: add UID-aware OTP state"
 **Files:**
 - Create: `lib/imap-otp-worker.js`
 - Create: `test/imap-otp-worker.test.js`
-- Modify: `server.js:268-376`
 
 **Interfaces:**
 - Produces `createImapOtpWorker({ createClient, parseMessage, onCandidate, onError, now, config })`.
@@ -181,7 +180,7 @@ Run: `node --test test/imap-otp-worker.test.js`
 
 Expected: `MODULE_NOT_FOUND` for `../lib/imap-otp-worker`.
 
-- [ ] **Step 3: Implement the adapter and replace legacy scanner calls**
+- [ ] **Step 3: Implement the adapter**
 
 ```js
 // Required incremental scan in lib/imap-otp-worker.js
@@ -200,16 +199,16 @@ async function scanPending(baselineUid) {
 
 Use ImapFlow's automatic IDLE behavior (`disableAutoIdle` remains false), subscribe to `client.on('exists', () => scanPending(minimumPendingBaseline()))`, and serialise scans with one promise so an `exists` event never starts a concurrent fetch. On `error` or `close`, classify errors as `imap_auth_failed`, `imap_proxy_failed`, or `imap_network_failed`; reconnect with delays of 1, 2, 4, 8 and 15 seconds, then run `scanPending(minimumPendingBaseline())`. `stop()` clears timers, removes event handlers and logs out once.
 
-- [ ] **Step 4: Run worker and backend tests**
+- [ ] **Step 4: Run worker and state tests**
 
-Run: `node --test test/imap-otp-worker.test.js test/otp-state.test.js && node --check server.js`
+Run: `node --test test/imap-otp-worker.test.js test/otp-state.test.js && node --check lib/imap-otp-worker.js`
 
 Expected: all tests pass and syntax check exits 0.
 
 - [ ] **Step 5: Commit the worker**
 
 ```powershell
-git add lib/imap-otp-worker.js test/imap-otp-worker.test.js server.js
+git add lib/imap-otp-worker.js test/imap-otp-worker.test.js
 git commit -m "feat: receive OTP messages by UID increment"
 ```
 
