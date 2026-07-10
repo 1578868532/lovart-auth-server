@@ -53,6 +53,17 @@ test('removes sessions at the configured TTL using the injected clock', () => {
   assert.equal(state.getSession(request), null);
 });
 
+test('does not return a session at the TTL boundary without expiring sessions first', () => {
+  let clock = 0;
+  const state = createState({ now: () => clock, sessionTtlMs: 1_000 });
+  const request = { targetEmail: 'a@example.test', machineId: 'm1', requestId: 'r1' };
+
+  state.createOrGetSession(request);
+  clock = 1_000;
+
+  assert.equal(state.getSession(request), null);
+});
+
 test('reuses a live session and completes it with the client-visible code', () => {
   const state = createState();
   const request = { targetEmail: 'a@example.test', machineId: 'm1', requestId: 'r1' };
