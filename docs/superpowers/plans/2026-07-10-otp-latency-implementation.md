@@ -230,17 +230,22 @@ git commit -m "feat: receive OTP messages by UID increment"
 // test/otp-api.test.js
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const http = require('node:http');
 
 test('does not report waiting when IMAP baseline setup fails', async () => {
-  const { app, setOtpWorkerForTest } = require('../server');
-  setOtpWorkerForTest({ snapshotBaseline: async () => { const error = new Error('proxy connect failed'); error.code = 'imap_proxy_failed'; throw error; } });
-  const response = await app.request('POST', '/api/otp/mark-baseline', { targetEmail: 'a@example.test' });
-  assert.equal(response.status, 502);
+  const { createApp } = require('../server');
+  const error = new Error('proxy connect failed'); error.code = 'imap_proxy_failed';
+  const app = createApp({ otpWorker: { snapshotBaseline: async () => { throw error; } }, otpState: fakeOtpState() });
+  const server = app.listen(0);
+  await once(server, 'listening');
+  const response = await postJson(server.address().port, '/api/otp/mark-baseline', authorizedBody());
+  await once(server.close(), 'close');
+  assert.equal(response.statusCode, 502);
   assert.equal(response.body.error, 'imap_proxy_failed');
 });
 ```
 
-Use the existing license middleware in the real test request. Add a small `createApp({ otpWorker, otpState })` factory and export it, rather than introducing a non-Express `app.request` API. The test must use Node's built-in `http.request` against an ephemeral `app.listen(0)` server.
+Define `once` from `node:events`; define `postJson(port, path, body)` with `http.request`; and make `authorizedBody()` supply a valid local-LV2 test license body accepted by the existing license middleware. Add a small `createApp({ otpWorker, otpState })` factory and export it; do not introduce a test-only `app.request` API. The test must use Node's built-in `http.request` against an ephemeral `app.listen(0)` server.
 
 - [ ] **Step 2: Run API tests and verify they fail**
 

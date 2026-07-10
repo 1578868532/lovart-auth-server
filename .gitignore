@@ -6,3 +6,4 @@ data/
 auth.db
 *.log
 .worktrees/
+.superpowers/
