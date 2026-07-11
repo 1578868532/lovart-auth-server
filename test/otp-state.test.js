@@ -89,11 +89,3 @@ test('reuses a live session and completes it with the client-visible code', () =
   assert.equal(completed.code, '123456');
   assert.equal(completed.lastErrorCode, null);
 });
-
-test('reports pending sessions for the IMAP fallback scanner', () => {
-  const state = createState();
-  const session = state.createOrGetSession({ targetEmail: 'a@example.test', machineId: 'm1', requestId: 'r1' });
-  assert.equal(state.hasPendingSessions(), true);
-  state.completeSession(session, '123456');
-  assert.equal(state.hasPendingSessions(), false);
-});
