@@ -555,7 +555,7 @@ app.post('/api/otp/get', async (req, res) => {
         return res.json({ success: true, code: session.code });
     }
 
-    const matched = otpState.matchAndConsume({ ...request, observedAfter: session.createdAt });
+    const matched = otpState.matchAndConsume(request);
     if (matched) {
         otpState.completeSession(session, matched.code);
         return res.json({ success: true, code: matched.code });

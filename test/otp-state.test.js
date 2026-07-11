@@ -23,18 +23,6 @@ test('only consumes a message with the same UIDVALIDITY and a UID after baseline
   assert.equal(state.matchAndConsume({ targetEmail: 'a@example.test', machineId: 'm1' }), null);
 });
 
-test('legacy request without a UID baseline only consumes mail observed after its session began', () => {
-  let clock = 100;
-  const state = createState({ now: () => clock });
-  const request = { targetEmail: 'a@example.test', machineId: 'm1', requestId: 'legacy-r1' };
-
-  state.addMessage({ uidValidity: 7n, uid: 40, to: 'a@example.test', text: 'old', code: '111111', receivedAt: 1, observedAt: 99, messageId: 'old' });
-  const session = state.createOrGetSession(request);
-  state.addMessage({ uidValidity: 7n, uid: 41, to: 'a@example.test', text: 'new', code: '222222', receivedAt: 1, observedAt: 100, messageId: 'new' });
-
-  assert.equal(state.matchAndConsume({ ...request, observedAfter: session.createdAt }).code, '222222');
-});
-
 test('returns a stable worker failure instead of waiting', () => {
   const state = createState({ now: () => 0 });
   const error = { code: 'imap_proxy_failed', at: 1 };

@@ -94,7 +94,6 @@ test('scanPending reads headers by UID then source only for a likely Lovart OTP'
     text: 'Your code is 123456',
     code: '123456',
     receivedAt: new Date(0),
-    observedAt: 1,
     messageId: 'message-1'
   }]);
   await worker.stop();
