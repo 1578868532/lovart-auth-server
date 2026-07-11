@@ -597,8 +597,10 @@ function createProductionOtpWorker(otpState) {
             const targetEmail = normalizeCandidateRecipient(candidate.to);
             if (!targetEmail) return;
             otpState.addMessage({ ...candidate, to: targetEmail });
+            console.log('[OTP IMAP] candidate accepted', JSON.stringify({ uid: candidate.uid }));
         },
         onError: error => {
+            console.error('[OTP IMAP] error', stableImapErrorCode(error));
             otpState.setWorkerError({
                 code: stableImapErrorCode(error),
                 at: Number.isFinite(error && error.at) ? error.at : now()
