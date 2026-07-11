@@ -5,10 +5,8 @@ const fs = require('fs');
 const path = require('path');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
-
-const app = express();
-app.use(cors());
-app.use(express.json({ limit: '32kb' }));
+const { createOtpState } = require('./lib/otp-state');
+const { createImapOtpWorker } = require('./lib/imap-otp-worker');
 
 const DATA_DIR = process.env.DATA_DIR ? path.resolve(process.env.DATA_DIR) : __dirname;
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -21,9 +19,6 @@ const OTP_RATE_WINDOW_MS = 60 * 1000;
 const OTP_SESSION_TTL_MS = Number(process.env.OTP_SESSION_TTL_MS || 5 * 60 * 1000);
 const OTP_BUFFER_MAX_AGE_MS = Number(process.env.OTP_BUFFER_MAX_AGE_MS || 10 * 60 * 1000);
 const OTP_BUFFER_MAX_SIZE = Number(process.env.OTP_BUFFER_MAX_SIZE || 200);
-const IMAP_POLL_INTERVAL_MS = Number(process.env.IMAP_POLL_INTERVAL_MS || 1500);
-const IMAP_SCAN_LIMIT = Number(process.env.IMAP_SCAN_LIMIT || 35);
-const LOCK_TTL_MS = Number(process.env.OTP_LOCK_TTL_MS || 1000);
 
 // Worker 层凭证（仅存在于此文件，不暴露到 API 层）
 const WORKER_EMAIL = String(process.env.OTP_EMAIL || '').trim();
@@ -33,25 +28,11 @@ const OTP_IMAP_PROXY_SERVER = String(process.env.OTP_IMAP_PROXY_SERVER || '').tr
 
 // === 抗并发 OTP 系统 ===
 // OTP Session Store: sessionKey → { email, machineId, requestId, code, createdAt, used, status }
-const otpStore = new Map();
-const otpBaselines = new Map();
 // Inbox Buffer: [{ to, text, code, timestamp, messageId, used }]
-const inboxBuffer = [];
 // Processing Lock: `${email}_${machineId}` → { time }
-const processingLock = new Map();
 // Rate limiting
 const otpRateBuckets = new Map();
 // IMAP Worker state
-let imapWorkerRunning = false;
-let imapWorkerTimer = null;
-const otpMetrics = {
-    lastPollAt: 0,
-    lastPollDurationMs: 0,
-    lastPollScanned: 0,
-    lastPollFound: 0,
-    lastPollError: '',
-    totalFound: 0
-};
 
 function createEmptyDB() {
     return { licenses: [], sessions: [] };
@@ -219,245 +200,26 @@ function normalizeTargetEmail(value) {
     return email;
 }
 
-function collectMessageText(parsed) {
-    const headers = [];
-    try {
-        for (const [key, value] of parsed.headers || []) {
-            headers.push(`${key}: ${Array.isArray(value) ? value.join(',') : value}`);
-        }
-    } catch (error) {}
+const IMAP_ERROR_CODES = new Set(['imap_auth_failed', 'imap_proxy_failed', 'imap_network_failed']);
 
-    return [
-        parsed.subject || '',
-        parsed.from && parsed.from.text ? parsed.from.text : '',
-        parsed.sender && parsed.sender.text ? parsed.sender.text : '',
-        parsed.to && parsed.to.text ? parsed.to.text : '',
-        parsed.cc && parsed.cc.text ? parsed.cc.text : '',
-        parsed.text || '',
-        parsed.html || '',
-        headers.join(' ')
-    ].join(' ');
+function stableImapErrorCode(value) {
+    const code = typeof value === 'string' ? value : value && value.code;
+    return IMAP_ERROR_CODES.has(code) ? code : 'imap_network_failed';
 }
 
-function isLovartOtpEmail(parsed) {
-    const content = collectMessageText(parsed).toLowerCase();
-    const sender = parsed.from && parsed.from.text ? parsed.from.text.toLowerCase() : '';
-    const subject = String(parsed.subject || '').toLowerCase();
-    const fromLovart = sender.includes('lovart') || sender.includes('lovart.ai');
-    const looksLikeOtp = subject.includes('welcome to lovart')
-        || subject.includes('lovart')
-        || content.includes('enter this code')
-        || content.includes('the lovart team');
-    return fromLovart && looksLikeOtp;
+function normalizeCandidateRecipient(value) {
+    const match = String(value || '').match(/[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+/);
+    return match ? normalizeTargetEmail(match[0]) : null;
 }
 
-function messageTargetsEmail(parsed, targetEmail) {
-    return !targetEmail || collectMessageText(parsed).toLowerCase().includes(targetEmail);
-}
 
-function getMessageId(parsed, sequence) {
-    return parsed.messageId || (parsed.date ? String(parsed.date.getTime()) : String(sequence));
-}
+function createApp({ otpWorker, otpState, now: appNow = now } = {}) {
+  if (!otpWorker || !otpState) throw new TypeError('otpWorker and otpState are required');
+  const app = express();
+  const trackedSessions = new Map();
 
-function extractOtpCode(parsed) {
-    const content = collectMessageText(parsed);
-    const contextual = content.match(/(?:code|verification)[\s\S]{0,300}?(\b\d{6}\b)/i);
-    if (contextual && contextual[1] !== '000000') return contextual[1];
-    return (content.match(/\b\d{6}\b/g) || []).find(code => code !== '000000') || null;
-}
-
-async function openOtpMailbox() {
-    if (!WORKER_EMAIL || !WORKER_PASS) throw new Error('worker credentials not configured');
-    const imapOptions = {
-        host: process.env.OTP_IMAP_HOST || 'imap.163.com',
-        port: Number(process.env.OTP_IMAP_PORT) || 993,
-        secure: String(process.env.OTP_IMAP_SECURE || 'true').toLowerCase() !== 'false',
-        auth: { user: WORKER_EMAIL, pass: WORKER_PASS },
-        logger: false
-    };
-    if (OTP_IMAP_USE_PROXY && OTP_IMAP_PROXY_SERVER) {
-        imapOptions.proxy = OTP_IMAP_PROXY_SERVER;
-    }
-    const client = new ImapFlow(imapOptions);
-    await client.connect();
-    await client.mailboxOpen('INBOX');
-    return client;
-}
-
-// === IMAP Worker：后台轮询新邮件，填充 inboxBuffer ===
-
-function extractTargetEmailFromMessage(parsed) {
-    const toText = parsed.to && parsed.to.text ? parsed.to.text.toLowerCase() : '';
-    const match = toText.match(/([^\s@]+@[^\s@]+\.[^\s@]+)/);
-    return match ? match[1] : '';
-}
-
-async function imapPollWorker(options = {}) {
-    if (imapWorkerRunning) return { skipped: true, reason: 'running' };
-
-    // 只在有 pending session 时才轮询 IMAP（节省资源）
-    const hasPending = Array.from(otpStore.values()).some(s => s.status === 'pending');
-    if (!hasPending && !options.force) return { skipped: true, reason: 'no_pending' };
-
-    imapWorkerRunning = true;
-    let client;
-    const startedAt = now();
-    let scanned = 0;
-    let found = 0;
-
-    try {
-        client = await openOtpMailbox();
-        const exists = client.mailbox && Number(client.mailbox.exists) || 0;
-        const scanLimit = Math.max(15, IMAP_SCAN_LIMIT);
-        const start = Math.max(1, exists - scanLimit + 1);
-        const fiveMinAgo = now() - OTP_BUFFER_MAX_AGE_MS;
-
-        for (let sequence = exists; sequence >= start; sequence--) {
-            scanned++;
-            const message = await client.fetchOne(String(sequence), { source: true });
-            if (!message || !message.source) continue;
-
-            const parsed = await simpleParser(message.source);
-
-            // 时间过滤：跳过超过 5 分钟的邮件
-            if (parsed.date && parsed.date.getTime() < fiveMinAgo) continue;
-
-            // 只处理 Lovart OTP 邮件
-            if (!isLovartOtpEmail(parsed)) continue;
-
-            const messageId = getMessageId(parsed, sequence);
-
-            // 去重：已在 buffer 中则跳过
-            if (inboxBuffer.some(item => item.messageId === messageId)) continue;
-
-            const code = extractOtpCode(parsed);
-            if (!code) continue;
-
-            const targetEmail = extractTargetEmailFromMessage(parsed);
-            const text = collectMessageText(parsed).toLowerCase();
-
-            inboxBuffer.push({
-                to: targetEmail,
-                text,
-                code,
-                timestamp: parsed.date ? parsed.date.getTime() : Date.now(),
-                messageId,
-                used: false
-            });
-            found++;
-
-            console.log('[IMAP Worker] new OTP email for:', targetEmail, 'code:', code, 'seq:', sequence);
-        }
-
-        // 清理过期和已消费的 buffer 条目
-        const cutoff = now() - OTP_BUFFER_MAX_AGE_MS;
-        for (let i = inboxBuffer.length - 1; i >= 0; i--) {
-            if (inboxBuffer[i].timestamp < cutoff || inboxBuffer[i].used) {
-                inboxBuffer.splice(i, 1);
-            }
-        }
-        while (inboxBuffer.length > OTP_BUFFER_MAX_SIZE) inboxBuffer.shift();
-
-        otpMetrics.lastPollError = '';
-        return { skipped: false, scanned, found };
-    } catch (error) {
-        otpMetrics.lastPollError = error.message;
-        console.error('[IMAP Worker] error:', error.message);
-        return { skipped: false, scanned, found, error: error.message };
-    } finally {
-        otpMetrics.lastPollAt = now();
-        otpMetrics.lastPollDurationMs = now() - startedAt;
-        otpMetrics.lastPollScanned = scanned;
-        otpMetrics.lastPollFound = found;
-        otpMetrics.totalFound += found;
-        if (client) {
-            try { await client.logout(); } catch (e) {}
-        }
-        imapWorkerRunning = false;
-    }
-}
-
-function startImapWorker() {
-    if (imapWorkerTimer) return;
-    imapWorkerTimer = setInterval(() => {
-        imapPollWorker().catch(err => console.error('[IMAP Worker] unhandled:', err));
-    }, IMAP_POLL_INTERVAL_MS);
-    console.log('[IMAP Worker] started, polling every', IMAP_POLL_INTERVAL_MS / 1000, 'seconds');
-}
-
-// === OTP 匹配与消费 ===
-
-function otpBaselineKey(email, machineId) {
-    return `${email || 'global'}_${machineId || 'global'}`;
-}
-
-function setOtpBaseline(email, machineId) {
-    otpBaselines.set(otpBaselineKey(email, machineId), now());
-}
-
-function getOtpBaseline(email, machineId) {
-    return otpBaselines.get(otpBaselineKey(email, machineId)) || 0;
-}
-
-function cleanupOtpBaselines() {
-    const expired = now() - OTP_BUFFER_MAX_AGE_MS;
-    for (const [key, timestamp] of otpBaselines) {
-        if (timestamp < expired) otpBaselines.delete(key);
-    }
-}
-
-function matchOTP(email, machineId) {
-    const fiveMinAgo = now() - OTP_BUFFER_MAX_AGE_MS;
-    const baselineAt = getOtpBaseline(email, machineId);
-
-    // 从最新往旧找，返回第一个未使用的匹配项
-    for (let i = inboxBuffer.length - 1; i >= 0; i--) {
-        const item = inboxBuffer[i];
-        if (item.used) continue;
-        if (item.timestamp < fiveMinAgo) continue;
-        if (baselineAt && item.timestamp < baselineAt) continue;
-
-        // 优先用 To 字段精确匹配
-        if (email && item.to === email) return item;
-
-        // 回退：检查邮件正文是否包含目标邮箱
-        if (email && item.text.includes(email)) return item;
-
-        // 无 email 参数时返回任意未使用项
-        if (!email) return item;
-    }
-    return null;
-}
-
-function consumeOTP(item) {
-    item.used = true;
-    const idx = inboxBuffer.indexOf(item);
-    if (idx >= 0) inboxBuffer.splice(idx, 1);
-}
-
-// === TTL 清理 ===
-
-function cleanupOtpStore() {
-    const expired = now() - OTP_SESSION_TTL_MS;
-    for (const [key, session] of otpStore) {
-        if (session.createdAt < expired) {
-            otpStore.delete(key);
-        }
-    }
-    cleanupOtpBaselines();
-}
-
-// === 并发锁 ===
-
-function acquireLock(key) {
-    const currentTime = now();
-    if (processingLock.has(key)) {
-        const lock = processingLock.get(key);
-        if (currentTime - lock.time < LOCK_TTL_MS) return false;
-    }
-    processingLock.set(key, { time: currentTime });
-    return true;
-}
+  app.use(cors());
+  app.use(express.json({ limit: '32kb' }));
 
 app.use((req, res, next) => {
   console.log('[REQ]', req.method, req.path, req.query || {});
@@ -469,17 +231,38 @@ app.get('/api/health', (req, res) => {
 });
 
 app.get('/api/otp/status', (req, res) => {
+    if (!requireAdmin(req, res)) return;
+    const workerStatus = typeof otpWorker.getStatus === 'function' ? otpWorker.getStatus() : {};
+    const stateStatus = typeof otpState.getStatus === 'function' ? otpState.getStatus() : {};
+    const latestErrorCode = workerStatus.lastErrorCode || (stateStatus.lastError && stateStatus.lastError.code);
+    let pendingSessions = 0;
+    for (const [key, request] of trackedSessions) {
+        const session = typeof otpState.getSession === 'function' ? otpState.getSession(request) : null;
+        if (!session || session.status !== 'pending') {
+            trackedSessions.delete(key);
+        } else {
+            pendingSessions += 1;
+        }
+    }
+
     res.json({
         success: true,
-        workerEmailConfigured: Boolean(WORKER_EMAIL),
-        workerPassConfigured: Boolean(WORKER_PASS),
-        pendingSessions: Array.from(otpStore.values()).filter(s => s.status === 'pending').length,
-        inboxBufferSize: inboxBuffer.length,
-        imapWorkerRunning,
-        scanLimit: IMAP_SCAN_LIMIT,
-        bufferMaxAgeMs: OTP_BUFFER_MAX_AGE_MS,
-        sessionTtlMs: OTP_SESSION_TTL_MS,
-        metrics: otpMetrics
+        worker: {
+            connected: Boolean(workerStatus.connected),
+            idling: Boolean(workerStatus.idling),
+            lastEventAt: Number.isFinite(workerStatus.lastEventAt) ? workerStatus.lastEventAt : null,
+            reconnectCount: Number(workerStatus.reconnectCount) || 0,
+            lastErrorCode: latestErrorCode ? stableImapErrorCode(latestErrorCode) : null,
+            proxyEnabled: OTP_IMAP_USE_PROXY
+        },
+        pendingSessions,
+        metrics: {
+            lastScanDurationMs: Number(workerStatus.lastScanDurationMs) || 0,
+            lastScanScanned: Number(workerStatus.lastScanScanned) || 0,
+            lastScanCandidates: Number(workerStatus.lastScanCandidates) || 0,
+            totalScanScanned: Number(workerStatus.totalScanScanned) || 0,
+            totalScanCandidates: Number(workerStatus.totalScanCandidates) || 0
+        }
     });
 });
 
@@ -742,17 +525,13 @@ app.post('/api/otp/mark-baseline', async (req, res) => {
     if (targetEmail === null) return res.status(400).json({ success: false, status: 'error', error: '目标邮箱格式无效' });
 
     try {
-        setOtpBaseline(targetEmail, auth.machineId);
-        for (const item of inboxBuffer) {
-            if (!item.used && (item.to === targetEmail || (targetEmail && item.text.includes(targetEmail)))) {
-                item.used = true;
-            }
-        }
-
-        console.log('[OTP] baseline marked for:', targetEmail);
-        res.json({ success: true });
+        const snapshot = await otpWorker.snapshotBaseline();
+        otpState.establishBaseline({ targetEmail, machineId: auth.machineId, ...snapshot });
+        return res.json({ success: true, baselineReady: true });
     } catch (error) {
-        res.status(502).json({ success: false, status: 'error', error: error.message });
+        const code = stableImapErrorCode(error);
+        otpState.setWorkerError({ code, at: appNow() });
+        return res.status(502).json({ success: false, status: 'error', error: code });
     }
 });
 
@@ -763,86 +542,34 @@ app.post('/api/otp/get', async (req, res) => {
     const targetEmail = normalizeTargetEmail(req.body && req.body.targetEmail);
     if (targetEmail === null) return res.status(400).json({ success: false, status: 'error', error: '目标邮箱格式无效' });
 
-    // 生成 requestId 和 sessionKey
-    const requestId = String(req.body && req.body.requestId || crypto.randomUUID()).trim();
-    const machineId = auth.machineId;
-    const sessionKey = `${targetEmail || 'global'}_${machineId}_${requestId}`;
+    const request = {
+        targetEmail,
+        machineId: auth.machineId,
+        requestId: String(req.body && req.body.requestId || crypto.randomUUID()).trim()
+    };
+    otpState.expireSessions();
+    const session = otpState.createOrGetSession(request);
+    trackedSessions.set(session.key, request);
 
-    // 定期清理过期 session
-    cleanupOtpStore();
-
-    // 检查已有 session
-    const existingSession = otpStore.get(sessionKey);
-    if (existingSession) {
-        if (existingSession.status === 'success' && existingSession.code) {
-            console.log('[OTP] session hit:', sessionKey, 'code:', existingSession.code);
-            return res.json({ success: true, code: existingSession.code });
-        }
-        if (existingSession.status === 'expired') {
-            return res.json({ success: false, status: 'expired', error: 'not_found' });
-        }
-        // session 仍在 pending，继续尝试匹配
-    } else {
-        // 创建新 session
-        otpStore.set(sessionKey, {
-            email: targetEmail,
-            machineId,
-            requestId,
-            code: null,
-            createdAt: now(),
-            used: false,
-            status: 'pending'
-        });
-
-        // TTL: 2 分钟后自动过期
-        setTimeout(() => {
-            const session = otpStore.get(sessionKey);
-            if (session && session.status === 'pending') {
-                session.status = 'expired';
-                otpStore.delete(sessionKey);
-                console.log('[OTP] session expired:', sessionKey);
-            }
-        }, OTP_SESSION_TTL_MS);
-
-        console.log('[OTP] new session:', sessionKey);
+    if (session.status === 'success' && session.code) {
+        return res.json({ success: true, code: session.code });
     }
 
-    // 从 inboxBuffer 匹配验证码
-    const matched = matchOTP(targetEmail, machineId);
+    const matched = otpState.matchAndConsume(request);
     if (matched) {
-        consumeOTP(matched);
-        const session = otpStore.get(sessionKey);
-        if (session) {
-            session.status = 'success';
-            session.code = matched.code;
-            session.used = true;
-        }
-        console.log('[OTP] match success:', sessionKey, 'code:', matched.code);
+        otpState.completeSession(session, matched.code);
         return res.json({ success: true, code: matched.code });
     }
 
-    // 未匹配到，主动触发一次 IMAP 轮询；并发请求只让一个去扫邮箱
-    const lockKey = `${targetEmail || 'global'}_${machineId}`;
-    if (acquireLock(lockKey)) {
-        await imapPollWorker({ force: true });
-        const matchedAfterPoll = matchOTP(targetEmail, machineId);
-        if (matchedAfterPoll) {
-            consumeOTP(matchedAfterPoll);
-            const session = otpStore.get(sessionKey);
-            if (session) {
-                session.status = 'success';
-                session.code = matchedAfterPoll.code;
-                session.used = true;
-            }
-            console.log('[OTP] match success after poll:', sessionKey, 'code:', matchedAfterPoll.code);
-            return res.json({ success: true, code: matchedAfterPoll.code });
-        }
-    } else {
-        imapPollWorker().catch(() => {});
+    const workerError = otpState.getStatus().lastError;
+    if (workerError && Number(workerError.at) > session.createdAt) {
+        const code = stableImapErrorCode(workerError);
+        session.lastErrorCode = code;
+        return res.status(502).json({ success: false, status: 'error', error: code });
     }
 
-    console.log('[OTP] waiting:', sessionKey);
     return res.json({ success: false, status: 'waiting', error: 'waiting' });
+
 });
 
 app.use((error, req, res, next) => {
@@ -850,12 +577,65 @@ app.use((error, req, res, next) => {
     next(error);
 });
 
-const PORT = process.env.PORT || 3000;
-if (require.main === module) {
-    app.listen(PORT, () => {
-        console.log(`auth server running on port ${PORT}`);
-        startImapWorker();
+  return app;
+}
+
+function createProductionOtpWorker(otpState) {
+    const imapOptions = {
+        host: process.env.OTP_IMAP_HOST || 'imap.163.com',
+        port: Number(process.env.OTP_IMAP_PORT) || 993,
+        secure: String(process.env.OTP_IMAP_SECURE || 'true').toLowerCase() !== 'false',
+        auth: { user: WORKER_EMAIL, pass: WORKER_PASS },
+        logger: false
+    };
+    if (OTP_IMAP_USE_PROXY && OTP_IMAP_PROXY_SERVER) imapOptions.proxy = OTP_IMAP_PROXY_SERVER;
+
+    return createImapOtpWorker({
+        createClient: () => new ImapFlow(imapOptions),
+        parseMessage: simpleParser,
+        onCandidate: candidate => {
+            const targetEmail = normalizeCandidateRecipient(candidate.to);
+            if (!targetEmail) return;
+            otpState.addMessage({ ...candidate, to: targetEmail });
+        },
+        onError: error => {
+            otpState.setWorkerError({
+                code: stableImapErrorCode(error),
+                at: Number.isFinite(error && error.at) ? error.at : now()
+            });
+        },
+        getMinimumPendingBaseline: () => null,
+        now
     });
 }
 
-module.exports = { app, loadDB, saveDB };
+const defaultOtpState = createOtpState({
+    now,
+    sessionTtlMs: OTP_SESSION_TTL_MS,
+    bufferMaxAgeMs: OTP_BUFFER_MAX_AGE_MS,
+    bufferMaxSize: OTP_BUFFER_MAX_SIZE
+});
+const defaultOtpWorker = createProductionOtpWorker(defaultOtpState);
+const app = createApp({ otpWorker: defaultOtpWorker, otpState: defaultOtpState, now });
+
+const PORT = process.env.PORT || 3000;
+if (require.main === module) {
+    const server = app.listen(PORT, () => {
+        console.log(`auth server running on port ${PORT}`);
+        defaultOtpWorker.start().catch(error => {
+            defaultOtpState.setWorkerError({ code: stableImapErrorCode(error), at: now() });
+        });
+    });
+
+    let stopping = false;
+    const stopServer = async () => {
+        if (stopping) return;
+        stopping = true;
+        await defaultOtpWorker.stop().catch(() => {});
+        server.close(() => process.exit(0));
+    };
+    process.once('SIGINT', stopServer);
+    process.once('SIGTERM', stopServer);
+}
+
+module.exports = { app, createApp, loadDB, saveDB };
