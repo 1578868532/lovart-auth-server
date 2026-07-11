@@ -605,6 +605,8 @@ function createProductionOtpWorker(otpState) {
             });
         },
         getMinimumPendingBaseline: () => null,
+        hasPendingWork: () => otpState.hasPendingSessions(),
+        config: { fallbackIntervalMs: 2_000 },
         now
     });
 }
