@@ -5,4 +5,3 @@ data/
 .private-backup/
 auth.db
 *.log
-.worktrees/
