@@ -12,7 +12,9 @@ const app = express();
 // Resource/card API is hosted by the same Render service. Mount it before the
 // JSON parser because the original serverless handler reads the request stream.
 app.all(['/api', '/'], (req, res, next) => {
-    if (!req.query || !req.query.action) return next();
+    const hasResourceAction = Boolean(req.query && req.query.action);
+    const isResourceAdminHome = req.method === 'GET' && req.path === '/api';
+    if (!hasResourceAction && !isResourceAdminHome) return next();
     Promise.resolve(resourceApiHandler(req, res)).catch(next);
 });
 app.use(cors());

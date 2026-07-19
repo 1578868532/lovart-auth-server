@@ -33,5 +33,9 @@ test('Render service exposes auth and resource health routes together', async ()
         const resource = await resourceResponse.json();
         assert.equal(resource.success, true);
         assert.equal(resource.service, 'lovart-card-api');
+
+        const resourceAdminResponse = await fetch(`${baseUrl}/api`);
+        assert.equal(resourceAdminResponse.status, 200);
+        assert.match(await resourceAdminResponse.text(), /<title>资源后台<\/title>/);
     });
 });
