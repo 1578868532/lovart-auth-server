@@ -44,7 +44,8 @@ used by the previous resource deployment:
 
 - `DATABASE_URL`
 - `CHANNEL_DATABASE_URL`
-- `LOVART_LICENSE_PRIVATE_KEY` (or the equivalent `LICENSE_PRIVATE_KEY`)
+- `LOVART_LICENSE_PRIVATE_KEY` (or the equivalent `LICENSE_PRIVATE_KEY`) for issuing new cards
+- `LOVART_LICENSE_PUBLIC_KEY` (optional; existing Lovart cards use the built-in matching public key by default)
 - `LOVART_DATA_SECURE_KEY`
 - `ADMIN_SECRET`
 

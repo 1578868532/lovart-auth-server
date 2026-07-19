@@ -8,6 +8,10 @@ const ENCRYPT_KEY = crypto.scryptSync(DATA_KEY_TEXT, 'salt', 32);
 const IV = Buffer.alloc(16, 0);
 const LICENSE_PRIVATE_KEY_TEXT = process.env.LOVART_LICENSE_PRIVATE_KEY || process.env.LICENSE_PRIVATE_KEY || '';
 const LICENSE_PRIVATE_KEY = normalizePrivateKey(LICENSE_PRIVATE_KEY_TEXT);
+const DEFAULT_LICENSE_PUBLIC_KEY = '-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEAJVmR7Yrj3zh/GDV9txERvI/v/9UI7w/4k/pR7n/tHlc=\n-----END PUBLIC KEY-----';
+const LICENSE_PUBLIC_KEY_TEXT = process.env.LOVART_LICENSE_PUBLIC_KEY || process.env.LICENSE_PUBLIC_KEY || DEFAULT_LICENSE_PUBLIC_KEY;
+const LICENSE_PUBLIC_KEY = createPublicKeySafe(normalizePublicKey(LICENSE_PUBLIC_KEY_TEXT));
+const LICENSE_SIGNING_PRIVATE_KEY = createPrivateKeySafe(LICENSE_PRIVATE_KEY);
 const SECURELINK_LICENSE_PRIVATE_KEY_DER = process.env.SECURELINK_LICENSE_PRIVATE_KEY_DER || 'MC4CAQAwBQYDK2VwBCIEIEJHnMdGJVKjTnSVuAR4mbDLC9YhL+Ns2YFtq5YsfydF';
 const ADMIN_SECRET = String(process.env.ADMIN_SECRET || '').trim();
 const BUILD_SHA = process.env.RENDER_GIT_COMMIT || process.env.VERCEL_GIT_COMMIT_SHA || process.env.GIT_COMMIT_SHA || 'development';
@@ -72,6 +76,18 @@ function normalizePrivateKey(value) {
   key = key.replace(/^LOVART_LICENSE_PRIVATE_KEY\s*=\s*/i, '').replace(/^LICENSE_PRIVATE_KEY\s*=\s*/i, '').trim();
   if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) key = key.slice(1, -1);
   return key.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\r\n/g, '\n').trim();
+}
+function normalizePublicKey(value) {
+  let key = String(value || '').trim();
+  key = key.replace(/^LOVART_LICENSE_PUBLIC_KEY\s*=\s*/i, '').replace(/^LICENSE_PUBLIC_KEY\s*=\s*/i, '').trim();
+  if ((key.startsWith('"') && key.endsWith('"')) || (key.startsWith("'") && key.endsWith("'"))) key = key.slice(1, -1);
+  return key.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n').replace(/\r\n/g, '\n').trim();
+}
+function createPublicKeySafe(value) {
+  try { return value ? crypto.createPublicKey(value) : null; } catch (e) { return null; }
+}
+function createPrivateKeySafe(value) {
+  try { return value ? crypto.createPrivateKey(value) : null; } catch (e) { return null; }
 }
 function loadJSON(file, fallback) {
   try { return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : fallback; } catch (e) { return fallback; }
@@ -335,15 +351,14 @@ function parseLicensePayload(key) {
   } catch (e) { return null; }
 }
 function verifySignedLicense(key) {
-  if (!LICENSE_PRIVATE_KEY) return null;
+  if (!LICENSE_PUBLIC_KEY) return null;
   const parts = String(key || '').split('.');
   if (parts.length !== 3) return null;
   try {
     const payloadB64 = parts[1];
     const sig = Buffer.from(parts[2], 'base64url');
-    const pub = crypto.createPublicKey(LICENSE_PRIVATE_KEY);
     const rawPayload = Buffer.from(Buffer.from(payloadB64, 'base64').toString('utf8'), 'utf8');
-    const ok = crypto.verify(null, rawPayload, pub, sig) || crypto.verify(null, Buffer.from(payloadB64), pub, sig);
+    const ok = crypto.verify(null, rawPayload, LICENSE_PUBLIC_KEY, sig) || crypto.verify(null, Buffer.from(payloadB64), LICENSE_PUBLIC_KEY, sig);
     return ok ? decodePayload(payloadB64) : null;
   } catch (e) { return null; }
 }
@@ -383,7 +398,7 @@ function readValidLicensePayload(key) {
   const raw = parseLicensePayload(key);
   if (!raw) return { payload: null, message: '卡密无效' };
   if (String(key || '').startsWith('LV3.')) {
-    if (!LICENSE_PRIVATE_KEY) return { payload: null, message: '服务器缺少 LV3 验签私钥' };
+    if (!LICENSE_PUBLIC_KEY) return { payload: null, message: '服务器缺少有效的 LV3 验签公钥' };
     const verified = verifySignedLicense(key);
     if (!verified) return { payload: null, message: 'LV3 卡密签名无效' };
     return { payload: verified };
@@ -406,12 +421,8 @@ function signLicense(payload, prefix, product) {
     payload.product = 'securelink';
     delete payload.Product;
   } else {
-    if (!LICENSE_PRIVATE_KEY) throw new Error('Lovart 发卡缺少私钥环境变量：请在 Vercel 设置 LOVART_LICENSE_PRIVATE_KEY 或 LICENSE_PRIVATE_KEY');
-    try {
-      key = crypto.createPrivateKey(LICENSE_PRIVATE_KEY);
-    } catch (e) {
-      throw new Error('Lovart 私钥格式不正确：Value 只填私钥内容，或整行 LICENSE_PRIVATE_KEY=...，不要填 sk_live。');
-    }
+    if (!LICENSE_SIGNING_PRIVATE_KEY) throw new Error('Lovart 发卡私钥未配置或格式不正确：请设置有效的 LOVART_LICENSE_PRIVATE_KEY 或 LICENSE_PRIVATE_KEY');
+    key = LICENSE_SIGNING_PRIVATE_KEY;
   }
   const payloadBytes = Buffer.from(JSON.stringify(payload), 'utf8');
   const sig = crypto.sign(null, payloadBytes, key);
@@ -2518,8 +2529,8 @@ async function issue(btn){if(!state.selected)return message('dashMsg','请选择
 }
 
 function adminPageV2() {
-  const lovartReady = LICENSE_PRIVATE_KEY ? '已配置' : '未配置';
-  const lovartWarn = LICENSE_PRIVATE_KEY ? '' : '<div class="notice">Lovart 私钥未配置：Lovart 卡密和领取链接会生成失败，账号代码不受影响。</div>';
+  const lovartReady = LICENSE_SIGNING_PRIVATE_KEY ? '已配置' : '未配置';
+  const lovartWarn = LICENSE_SIGNING_PRIVATE_KEY ? '' : '<div class="notice">Lovart 发卡私钥未配置或格式不正确：现有卡密仍可验签，但新卡密和领取链接会生成失败。</div>';
   return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>资源后台</title><style>
 :root{color-scheme:dark;--bg:#101113;--panel:#1b1c1f;--panel2:#222327;--line:#343842;--text:#f3f6fb;--muted:#9aa4b2;--accent:#a66cff;--accent2:#15d6c7;--danger:#ff5b67;--ok:#45d483}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,"Microsoft YaHei",sans-serif;font-size:14px}.wrap{max-width:1280px;margin:0 auto;padding:28px}.top{display:flex;align-items:center;justify-content:space-between;gap:16px;padding-bottom:18px;border-bottom:1px solid var(--line);margin-bottom:22px}.top h1{margin:0;font-size:28px}.pill{border:1px solid var(--accent2);color:var(--accent2);border-radius:999px;padding:8px 12px;white-space:nowrap}.notice{border:1px solid #9a6700;background:#2b2110;color:#ffd98a;border-radius:8px;padding:12px;margin-bottom:16px}.grid{display:grid;grid-template-columns:1.1fr .9fr;gap:18px}.panel{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:20px}.panel h2{font-size:18px;margin:0 0 16px;color:#c391ff}.form{display:grid;grid-template-columns:repeat(12,1fr);gap:12px;align-items:end}.field{display:flex;flex-direction:column;gap:7px}.field label,.label{color:var(--muted);font-size:12px}.col-2{grid-column:span 2}.col-3{grid-column:span 3}.col-4{grid-column:span 4}.col-5{grid-column:span 5}.col-6{grid-column:span 6}.col-8{grid-column:span 8}.col-12{grid-column:span 12}input,select,textarea{width:100%;background:var(--panel2);border:1px solid #454954;color:var(--text);border-radius:8px;padding:11px 12px;font:inherit}textarea{min-height:112px;font-family:Consolas,monospace;resize:vertical}button{border:0;border-radius:8px;background:var(--accent);color:#100f13;font-weight:700;padding:12px 16px;cursor:pointer;white-space:nowrap}button.secondary{background:#2d3036;color:var(--text);border:1px solid #474c58}button.danger{background:var(--danger);color:white}button.ok{background:var(--accent2)}button:disabled{opacity:.65;cursor:wait}.seg{display:flex;gap:10px;flex-wrap:wrap}.seg label{display:flex;align-items:center;gap:8px;background:var(--panel2);border:1px solid #3c404a;border-radius:8px;padding:10px 12px;min-width:145px}.domains{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;background:var(--panel2);border:1px solid #454954;border-radius:8px;padding:12px}.domains label{display:flex;gap:8px;align-items:center}.hint{color:var(--muted);line-height:1.6;margin:12px 0 0}.result{display:none;margin-top:14px;background:#111316;border:1px solid #2c6b67;border-left:4px solid var(--accent2);border-radius:8px;padding:12px;word-break:break-all}.key{font-family:Consolas,monospace;color:var(--accent2);margin-top:8px}.stats{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px}.stat{background:var(--panel2);border:1px solid #3a3e48;border-radius:8px;padding:10px 12px;min-width:110px}.stat.risk{border-color:#ff5b67;color:#ffd6d9}.table-tools{display:grid;grid-template-columns:2fr 1fr 1.2fr 1fr auto;gap:10px;margin:12px 0}.pager{display:flex;align-items:center;justify-content:flex-end;gap:8px;margin-top:10px;color:var(--muted)}.pager button{padding:8px 12px}.risk-row{background:rgba(255,91,103,.08)}.badge{display:inline-block;border-radius:999px;padding:4px 8px;font-size:12px;font-weight:700}.badge-ok{background:rgba(69,212,131,.16);color:#7bf0aa}.badge-risk{background:rgba(255,91,103,.18);color:#ff9aa2}.badge-muted{background:#2d3036;color:#b7c0cd}.stat b{font-size:20px;margin-right:4px}.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:8px}table{width:100%;border-collapse:collapse;min-width:760px}th,td{border-bottom:1px solid #2d3038;padding:10px;text-align:left;vertical-align:top}th{color:var(--muted);font-weight:600;background:#17191d}.muted{color:var(--muted)}.full{grid-column:1/-1}@media(max-width:920px){.grid{grid-template-columns:1fr}.col-2,.col-3,.col-4,.col-5,.col-6,.col-8{grid-column:span 12}.domains{grid-template-columns:1fr}.wrap{padding:16px}.top{align-items:flex-start;flex-direction:column}.table-tools{grid-template-columns:1fr}.pager{justify-content:flex-start;flex-wrap:wrap}}
