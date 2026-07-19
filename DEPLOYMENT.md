@@ -36,6 +36,22 @@ Set `LOVART_AUTH_SERVER_URL` to the deployed HTTPS base URL **before** packaging
 LOVART_AUTH_SERVER_URL=https://your-service.onrender.com
 ```
 
+## Resource/card API on Render
+
+The Render service also mounts the resource/card handler on `/?action=...` and
+`/api?action=...`. Configure these environment variables with the same values
+used by the previous resource deployment:
+
+- `DATABASE_URL`
+- `CHANNEL_DATABASE_URL`
+- `LOVART_LICENSE_PRIVATE_KEY` (or the equivalent `LICENSE_PRIVATE_KEY`)
+- `LOVART_DATA_SECURE_KEY`
+- `ADMIN_SECRET`
+
+Set `LOVART_CARD_SERVER_URL` to this Render service base URL so OTP access checks
+stay inside the live service. The desktop must use the same base URL for both
+authorization and resource requests.
+
 Never ship a production Electron build without this env var pointing to the Render HTTPS address.
 
 ## Existing-license transition

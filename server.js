@@ -6,8 +6,15 @@ const path = require('path');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
 const { createOtpAccessVerifier } = require('./otp-access-policy');
+const resourceApiHandler = require('./resource-service/api/index');
 
 const app = express();
+// Resource/card API is hosted by the same Render service. Mount it before the
+// JSON parser because the original serverless handler reads the request stream.
+app.all(['/api', '/'], (req, res, next) => {
+    if (!req.query || !req.query.action) return next();
+    Promise.resolve(resourceApiHandler(req, res)).catch(next);
+});
 app.use(cors());
 app.use(express.json({ limit: '32kb' }));
 
@@ -23,7 +30,10 @@ const OTP_RATE_WINDOW_MS = 60 * 1000;
 const OTP_SESSION_TTL_MS = Number(process.env.OTP_SESSION_TTL_MS || 5 * 60 * 1000);
 const OTP_BUFFER_MAX_AGE_MS = Number(process.env.OTP_BUFFER_MAX_AGE_MS || 10 * 60 * 1000);
 const OTP_BUFFER_MAX_SIZE = Number(process.env.OTP_BUFFER_MAX_SIZE || 200);
-const CARD_SERVICE_URL = String(process.env.LOVART_CARD_SERVER_URL || process.env.CARD_SERVICE_URL || 'https://repository-name-sage.vercel.app').replace(/\/+$/, '');
+const CONFIGURED_CARD_SERVICE_URL = String(process.env.LOVART_CARD_SERVER_URL || process.env.CARD_SERVICE_URL || '').replace(/\/+$/, '');
+const CARD_SERVICE_URL = !CONFIGURED_CARD_SERVICE_URL || CONFIGURED_CARD_SERVICE_URL === 'https://repository-name-sage.vercel.app'
+    ? 'https://lovart-auth-server.onrender.com'
+    : CONFIGURED_CARD_SERVICE_URL;
 const OTP_ACCESS_CACHE_TTL_MS = Number(process.env.OTP_ACCESS_CACHE_TTL_MS || 5000);
 const OTP_ACCESS_TIMEOUT_MS = Number(process.env.OTP_ACCESS_TIMEOUT_MS || 8000);
 const IMAP_POLL_INTERVAL_MS = Number(process.env.IMAP_POLL_INTERVAL_MS || 1500);
@@ -487,7 +497,7 @@ app.use((req, res, next) => {
 });
 
 app.get('/api/health', (req, res) => {
-    res.json({ success: true, message: 'auth server running', buildSha: BUILD_SHA, otpCardAccessEnabled: true, time: now() });
+    res.json({ success: true, message: 'auth server running', buildSha: BUILD_SHA, otpCardAccessEnabled: true, resourceApiMounted: true, time: now() });
 });
 
 app.get('/api/otp/status', (req, res) => {
