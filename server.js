@@ -5,6 +5,7 @@ const fs = require('fs');
 const path = require('path');
 const { ImapFlow } = require('imapflow');
 const { simpleParser } = require('mailparser');
+const { createOtpAccessVerifier } = require('./otp-access-policy');
 
 const app = express();
 app.use(cors());
@@ -21,6 +22,9 @@ const OTP_RATE_WINDOW_MS = 60 * 1000;
 const OTP_SESSION_TTL_MS = Number(process.env.OTP_SESSION_TTL_MS || 5 * 60 * 1000);
 const OTP_BUFFER_MAX_AGE_MS = Number(process.env.OTP_BUFFER_MAX_AGE_MS || 10 * 60 * 1000);
 const OTP_BUFFER_MAX_SIZE = Number(process.env.OTP_BUFFER_MAX_SIZE || 200);
+const CARD_SERVICE_URL = String(process.env.LOVART_CARD_SERVER_URL || process.env.CARD_SERVICE_URL || 'https://repository-name-sage.vercel.app').replace(/\/+$/, '');
+const OTP_ACCESS_CACHE_TTL_MS = Number(process.env.OTP_ACCESS_CACHE_TTL_MS || 5000);
+const OTP_ACCESS_TIMEOUT_MS = Number(process.env.OTP_ACCESS_TIMEOUT_MS || 8000);
 const IMAP_POLL_INTERVAL_MS = Number(process.env.IMAP_POLL_INTERVAL_MS || 1500);
 const IMAP_SCAN_LIMIT = Number(process.env.IMAP_SCAN_LIMIT || 35);
 const LOCK_TTL_MS = Number(process.env.OTP_LOCK_TTL_MS || 1000);
@@ -41,6 +45,11 @@ const inboxBuffer = [];
 const processingLock = new Map();
 // Rate limiting
 const otpRateBuckets = new Map();
+const verifyOtpAccess = createOtpAccessVerifier({
+    baseUrl: CARD_SERVICE_URL,
+    cacheTtlMs: OTP_ACCESS_CACHE_TTL_MS,
+    timeoutMs: OTP_ACCESS_TIMEOUT_MS
+});
 // IMAP Worker state
 let imapWorkerRunning = false;
 let imapWorkerTimer = null;
@@ -201,6 +210,18 @@ function requireLicenseSession(req, res) {
         res.status(500).json({ success: false, error: error.message });
         return null;
     }
+}
+
+async function requireOtpEmailAccess(auth, targetEmail, res) {
+    const access = await verifyOtpAccess(auth, targetEmail);
+    if (access.allowed) return true;
+    const unavailable = access.error === 'otp_access_service_unavailable';
+    res.status(unavailable ? 503 : 403).json({
+        success: false,
+        status: 'error',
+        error: unavailable ? '验证码授权服务暂时不可用' : (access.error || '该账号无权获取验证码')
+    });
+    return false;
 }
 
 function allowOtpRequest(key) {
@@ -740,6 +761,7 @@ app.post('/api/otp/mark-baseline', async (req, res) => {
     if (!allowOtpRequest(auth.rateLimitKey)) return res.status(429).json({ success: false, status: 'error', error: '请求过于频繁' });
     const targetEmail = normalizeTargetEmail(req.body && req.body.targetEmail);
     if (targetEmail === null) return res.status(400).json({ success: false, status: 'error', error: '目标邮箱格式无效' });
+    if (!(await requireOtpEmailAccess(auth, targetEmail, res))) return;
 
     try {
         setOtpBaseline(targetEmail, auth.machineId);
@@ -762,6 +784,7 @@ app.post('/api/otp/get', async (req, res) => {
     if (!allowOtpRequest(auth.rateLimitKey)) return res.status(429).json({ success: false, status: 'error', error: '请求过于频繁' });
     const targetEmail = normalizeTargetEmail(req.body && req.body.targetEmail);
     if (targetEmail === null) return res.status(400).json({ success: false, status: 'error', error: '目标邮箱格式无效' });
+    if (!(await requireOtpEmailAccess(auth, targetEmail, res))) return;
 
     // 生成 requestId 和 sessionKey
     const requestId = String(req.body && req.body.requestId || crypto.randomUUID()).trim();
