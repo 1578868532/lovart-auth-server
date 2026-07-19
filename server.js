@@ -116,6 +116,39 @@ function createToken() {
     return crypto.randomBytes(32).toString('hex');
 }
 
+function clampInteger(value, fallback, min, max) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return fallback;
+    return Math.max(min, Math.min(Math.floor(parsed), max));
+}
+
+async function verifyResourceIssuedLicense(licenseKey, machineId) {
+    if (!String(licenseKey || '').startsWith('LV3.')) {
+        return { ok: false, status: 404, message: '卡密不存在' };
+    }
+    if (typeof resourceApiHandler.authorizeCloudLicense !== 'function') {
+        return { ok: false, status: 503, message: '授权校验服务暂不可用' };
+    }
+    return resourceApiHandler.authorizeCloudLicense(licenseKey, machineId);
+}
+
+function createResourceLicenseRecord(authorization) {
+    const payload = authorization.payload || {};
+    return {
+        licenseKey: authorization.key,
+        plan: payload.plan === 'permanent' ? 'permanent' : 'monthly',
+        expire_at: Number(payload.expire),
+        status: 'active',
+        bound_machine_id: authorization.machineId,
+        activated_at: now(),
+        maxSlots: clampInteger(payload.maxSlots, 3, 1, 50),
+        maxAccounts: clampInteger(payload.accountCount, 0, 0, 500),
+        durationDays: clampInteger(payload.durationDays, null, 1, 3650),
+        created_at: Number(payload.issuedAt) || now(),
+        source: 'resource-card'
+    };
+}
+
 function createLicenseKey() {
     return `LV-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
 }
@@ -580,14 +613,43 @@ app.post('/api/admin/unbind-license', (req, res) => {
     res.json({ success: true, message: '已解绑', license });
 });
 
-app.post('/api/activate', (req, res) => {
+app.post('/api/activate', async (req, res) => {
     const licenseKey = String(req.body && req.body.licenseKey || '').trim();
     const machineId = String(req.body && req.body.machineId || '').trim();
     if (!licenseKey || !machineId) return res.status(400).json({ success: false, message: '缺少卡密或机器码' });
 
     const db = loadDB();
-    const license = db.licenses.find(item => item.licenseKey === licenseKey);
-    if (!license) return res.status(404).json({ success: false, message: '卡密不存在' });
+    let license = db.licenses.find(item => item.licenseKey === licenseKey);
+    if (license && license.status !== 'active') {
+        return res.status(403).json({ success: false, message: '卡密已被封禁' });
+    }
+
+    if (!license || license.source === 'resource-card') {
+        let authorization;
+        try {
+            authorization = await verifyResourceIssuedLicense(licenseKey, machineId);
+        } catch (error) {
+            console.error('[activate] resource card verification failed:', error.message);
+            return res.status(503).json({ success: false, message: '授权校验服务暂不可用' });
+        }
+        if (!authorization.ok) {
+            return res.status(authorization.status || 403).json({ success: false, message: authorization.message || '卡密无效' });
+        }
+
+        const verifiedLicense = createResourceLicenseRecord(authorization);
+        if (!license) {
+            license = verifiedLicense;
+            db.licenses.push(license);
+        } else {
+            license.plan = verifiedLicense.plan;
+            license.expire_at = verifiedLicense.expire_at;
+            license.bound_machine_id = verifiedLicense.bound_machine_id;
+            license.maxSlots = verifiedLicense.maxSlots;
+            license.maxAccounts = verifiedLicense.maxAccounts;
+            license.durationDays = verifiedLicense.durationDays;
+        }
+    }
+
     if (license.status !== 'active') return res.status(403).json({ success: false, message: '卡密已被封禁' });
     if (now() > Number(license.expire_at)) return res.status(403).json({ success: false, message: '卡密已过期' });
     if (license.bound_machine_id && license.bound_machine_id !== machineId) {
@@ -615,11 +677,12 @@ app.post('/api/activate', (req, res) => {
         plan: license.plan,
         maxSlots: license.maxSlots,
         maxAccounts: license.maxAccounts,
+        durationDays: license.durationDays,
         serverTime: now()
     });
 });
 
-app.post('/api/verify', (req, res) => {
+app.post('/api/verify', async (req, res) => {
     const sessionToken = String(req.body && req.body.sessionToken || '').trim();
     const machineId = String(req.body && req.body.machineId || '').trim();
     if (!sessionToken || !machineId) return res.status(400).json({ success: false, message: '缺少授权信息' });
@@ -630,6 +693,14 @@ app.post('/api/verify', (req, res) => {
         if (!session || session.machineId !== machineId) return res.status(401).json({ success: false, message: '授权会话无效' });
         const license = db.licenses.find(item => item.licenseKey === session.licenseKey);
         if (!license || license.status !== 'active') return res.status(403).json({ success: false, message: '授权已失效' });
+        if (license.source === 'resource-card') {
+            const authorization = await verifyResourceIssuedLicense(license.licenseKey, machineId);
+            if (!authorization.ok) {
+                db.sessions = db.sessions.filter(item => item.sessionToken !== sessionToken);
+                saveDB(db);
+                return res.status(authorization.status || 403).json({ success: false, message: authorization.message || '授权已失效' });
+            }
+        }
         if (now() > Number(license.expire_at) || now() > Number(session.expire_at)) {
             return res.status(403).json({ success: false, message: '授权已到期' });
         }
@@ -639,6 +710,7 @@ app.post('/api/verify', (req, res) => {
             plan: license.plan,
             maxSlots: license.maxSlots,
             maxAccounts: license.maxAccounts,
+            durationDays: license.durationDays,
             serverTime: now(),
             forceUpdate: false
         });
