@@ -2631,3 +2631,8 @@ function copyInput(id){var el=document.getElementById(id);el.select();document.e
 window.onload=function(){setupDayInputs();updateLicenseProduct();loadAdminSettings();loadStorageStats();loadIssuedLicenses();loadActivations();loadTrials();loadBlacklist();loadAccountPools()}
 </script></body></html>`;
 }
+
+// The Render auth routes share the same signed-card policy as the resource
+// routes. Exporting the verifier keeps signature, machine, expiry, blacklist,
+// and revocation checks in one place.
+module.exports.authorizeCloudLicense = authorizeCloudLicense;
