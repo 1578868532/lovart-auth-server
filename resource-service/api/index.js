@@ -3,7 +3,10 @@ const fs = require('fs');
 let neon = null;
 try { neon = require('@neondatabase/serverless').neon; } catch (e) {}
 
-const DATA_KEY_TEXT = process.env.LOVART_DATA_SECURE_KEY || 'LOVART_DATA_SECURE_KEY';
+// Account import codes must remain compatible with the encryption key embedded
+// in every currently released desktop client. A server-only override makes the
+// generated code impossible for those clients to decrypt.
+const DATA_KEY_TEXT = 'LOVART_DATA_SECURE_KEY';
 const ENCRYPT_KEY = crypto.scryptSync(DATA_KEY_TEXT, 'salt', 32);
 const IV = Buffer.alloc(16, 0);
 const LICENSE_PRIVATE_KEY_TEXT = process.env.LOVART_LICENSE_PRIVATE_KEY || process.env.LICENSE_PRIVATE_KEY || '';
