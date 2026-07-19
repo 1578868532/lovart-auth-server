@@ -17,6 +17,7 @@ const DB_FILE = path.join(DATA_DIR, 'db.json');
 const IS_PRODUCTION = process.env.NODE_ENV === 'production';
 // In production ADMIN_SECRET must be set via environment variable; the fallback only works in local dev.
 const ADMIN_SECRET = process.env.ADMIN_SECRET || (IS_PRODUCTION ? '' : 'dev-local-only-not-for-production');
+const BUILD_SHA = process.env.RENDER_GIT_COMMIT || process.env.GIT_COMMIT_SHA || 'development';
 const OTP_RATE_LIMIT = Number(process.env.OTP_RATE_LIMIT || 120);
 const OTP_RATE_WINDOW_MS = 60 * 1000;
 const OTP_SESSION_TTL_MS = Number(process.env.OTP_SESSION_TTL_MS || 5 * 60 * 1000);
@@ -486,7 +487,7 @@ app.use((req, res, next) => {
 });
 
 app.get('/api/health', (req, res) => {
-    res.json({ success: true, message: 'auth server running', time: now() });
+    res.json({ success: true, message: 'auth server running', buildSha: BUILD_SHA, otpCardAccessEnabled: true, time: now() });
 });
 
 app.get('/api/otp/status', (req, res) => {
