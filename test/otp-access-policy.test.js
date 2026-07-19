@@ -38,6 +38,32 @@ test('card-service revocation or blacklist denial fails closed', async () => {
     assert.match(result.error, /撤销/);
 });
 
+test('resource-card cloud sessions are rechecked before OTP access', async () => {
+    let request = null;
+    const verify = createOtpAccessVerifier({
+        baseUrl: 'https://card.example',
+        fetchImpl: async (url, options) => {
+            request = { url, options };
+            return { ok: false, json: async () => ({ success: false, allowed: false, message: '该机器已被拉黑' }) };
+        },
+        timeoutMs: 1000
+    });
+    const result = await verify({
+        licenseMode: 'cloud-session',
+        machineId: 'machine-1',
+        session: { licenseKey: auth.licenseKey },
+        license: { licenseKey: auth.licenseKey, source: 'resource-card' }
+    }, 'User@Example.com');
+    assert.equal(result.allowed, false);
+    assert.match(result.error, /拉黑/);
+    assert.equal(request.url, 'https://card.example/api?action=otp_access_check');
+    assert.deepEqual(JSON.parse(request.options.body), {
+        licenseKey: auth.licenseKey,
+        machineId: 'machine-1',
+        targetEmail: 'user@example.com'
+    });
+});
+
 test('card-service outages fail closed', async () => {
     const verify = createOtpAccessVerifier({
         baseUrl: 'https://card.example',
@@ -48,7 +74,7 @@ test('card-service outages fail closed', async () => {
     assert.deepEqual(result, { allowed: false, error: 'otp_access_service_unavailable' });
 });
 
-test('legacy server sessions keep their existing database authorization path', async () => {
+test('auth-server-native legacy sessions keep their existing database authorization path', async () => {
     let called = false;
     const verify = createOtpAccessVerifier({
         baseUrl: 'https://card.example',
