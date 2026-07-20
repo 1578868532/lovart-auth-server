@@ -9,16 +9,12 @@ function createOtpAccessVerifier(options = {}) {
     const cache = new Map();
 
     return async function verifyOtpAccess(auth, targetEmail) {
-        // Resource-issued LV3 cards must be rechecked on every OTP access path,
-        // including sessions created through /api/activate. This prevents an
-        // already-issued session from bypassing later expiry, revocation or a
-        // machine blacklist. Only auth-server-native legacy sessions retain the
-        // historical database-only path.
-        const isLocalCard = auth && auth.licenseMode === 'local-lv2';
-        const isResourceSession = auth && auth.license && auth.license.source === 'resource-card';
-        if (!isLocalCard && !isResourceSession) return { allowed: true, legacySession: true };
+        // Legacy server-session licenses continue to use their own DB status.
+        // Current desktop LV3 cards use local-lv2 mode and must be checked by
+        // the resource/card service for blacklist, revocation and ownership.
+        if (!auth || auth.licenseMode !== 'local-lv2') return { allowed: true, legacySession: true };
         const email = String(targetEmail || '').trim().toLowerCase();
-        const licenseKey = String(auth.licenseKey || (auth.license && auth.license.licenseKey) || (auth.session && auth.session.licenseKey) || '').trim();
+        const licenseKey = String(auth.licenseKey || '').trim();
         const machineId = String(auth.machineId || '').trim();
         if (!baseUrl || typeof fetchImpl !== 'function') return { allowed: false, error: 'otp_access_service_unavailable' };
         if (!email || !licenseKey || !machineId) return { allowed: false, error: 'otp_access_invalid_request' };
