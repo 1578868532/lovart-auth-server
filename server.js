@@ -34,6 +34,9 @@ const OTP_BUFFER_MAX_SIZE = Number(process.env.OTP_BUFFER_MAX_SIZE || 200);
 const IMAP_POLL_INTERVAL_MS = Number(process.env.IMAP_POLL_INTERVAL_MS || 1500);
 const IMAP_SCAN_LIMIT = Number(process.env.IMAP_SCAN_LIMIT || 35);
 const LOCK_TTL_MS = Number(process.env.OTP_LOCK_TTL_MS || 1000);
+const NEW_AUTH_SERVER_URL = String(process.env.LOVART_NEW_AUTH_SERVER_URL || 'https://lovart-auth-server-new.onrender.com').replace(/\/+$/, '');
+const NEW_AUTH_VERIFY_TIMEOUT_MS = Number(process.env.NEW_AUTH_VERIFY_TIMEOUT_MS || 8000);
+const OTP_AUTH_CACHE_TTL_MS = Number(process.env.OTP_AUTH_CACHE_TTL_MS || 60 * 1000);
 
 // Worker 层凭证（仅存在于此文件，不暴露到 API 层）
 const WORKER_EMAIL = String(process.env.OTP_EMAIL || '').trim();
@@ -45,6 +48,7 @@ const OTP_IMAP_PROXY_SERVER = String(process.env.OTP_IMAP_PROXY_SERVER || '').tr
 // OTP Session Store: sessionKey → { email, machineId, requestId, code, createdAt, used, status }
 const otpStore = new Map();
 const otpBaselines = new Map();
+const otpAuthCompatibilityCache = new Map();
 // Inbox Buffer: [{ to, text, code, timestamp, messageId, used }]
 const inboxBuffer = [];
 // Processing Lock: `${email}_${machineId}` → { time }
@@ -244,6 +248,99 @@ function requireLicenseSession(req, res) {
         res.status(500).json({ success: false, error: error.message });
         return null;
     }
+}
+
+function compatibleAuthCacheKey(sessionToken, machineId) {
+    return crypto.createHash('sha256').update(`${sessionToken}\n${machineId}`).digest('hex');
+}
+
+function getCachedCompatibleAuth(sessionToken, machineId) {
+    const key = compatibleAuthCacheKey(sessionToken, machineId);
+    const cached = otpAuthCompatibilityCache.get(key);
+    if (!cached) return null;
+    if (cached.expiresAt <= now()) {
+        otpAuthCompatibilityCache.delete(key);
+        return null;
+    }
+    return {
+        sessionToken,
+        machineId,
+        rateLimitKey: `otp-auth:${key}`,
+        source: cached.source
+    };
+}
+
+function cacheCompatibleAuth(sessionToken, machineId, source) {
+    const key = compatibleAuthCacheKey(sessionToken, machineId);
+    otpAuthCompatibilityCache.set(key, { source, expiresAt: now() + OTP_AUTH_CACHE_TTL_MS });
+    if (otpAuthCompatibilityCache.size > 2000) {
+        const currentTime = now();
+        for (const [cacheKey, cached] of otpAuthCompatibilityCache) {
+            if (cached.expiresAt <= currentTime || otpAuthCompatibilityCache.size > 1500) {
+                otpAuthCompatibilityCache.delete(cacheKey);
+            }
+        }
+    }
+    return {
+        sessionToken,
+        machineId,
+        rateLimitKey: `otp-auth:${key}`,
+        source
+    };
+}
+
+async function verifySessionWithNewAuth(sessionToken, machineId) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), NEW_AUTH_VERIFY_TIMEOUT_MS);
+    try {
+        const response = await fetch(`${NEW_AUTH_SERVER_URL}/api/verify`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ sessionToken, machineId }),
+            signal: controller.signal
+        });
+        const data = await response.json().catch(() => ({}));
+        return Boolean(response.ok && data && data.success);
+    } finally {
+        clearTimeout(timeout);
+    }
+}
+
+async function requireCompatibleLicenseSession(req, res) {
+    const body = req.body || {};
+    if (body.licenseMode === 'local-lv2') return requireLicenseSession(req, res);
+
+    const authorization = String(req.headers.authorization || '');
+    const sessionToken = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+    const machineId = String(req.headers['x-machine-id'] || '').trim();
+    if (!sessionToken || !machineId) {
+        res.status(401).json({ success: false, error: 'missing_authorization' });
+        return null;
+    }
+
+    const cached = getCachedCompatibleAuth(sessionToken, machineId);
+    if (cached) return cached;
+
+    try {
+        if (await verifySessionWithNewAuth(sessionToken, machineId)) {
+            return cacheCompatibleAuth(sessionToken, machineId, 'new-auth');
+        }
+    } catch (error) {
+        console.warn('[OTP auth compatibility] new auth verification unavailable:', error.message);
+    }
+
+    try {
+        const legacyAuth = getLicenseForSession(req);
+        if (!legacyAuth.error) {
+            cacheCompatibleAuth(sessionToken, machineId, 'legacy-auth');
+            return { ...legacyAuth, source: 'legacy-auth' };
+        }
+    } catch (error) {
+        console.warn('[OTP auth compatibility] legacy auth verification failed:', error.message);
+    }
+
+    res.status(401).json({ success: false, error: 'authorization_session_invalid' });
+    return null;
 }
 
 function allowOtpRequest(key) {
@@ -817,7 +914,7 @@ app.post('/api', (req, res, next) => {
 });
 
 app.post('/api/otp/mark-baseline', async (req, res) => {
-    const auth = requireLicenseSession(req, res);
+    const auth = await requireCompatibleLicenseSession(req, res);
     if (!auth) return;
     if (!allowOtpRequest(auth.rateLimitKey)) return res.status(429).json({ success: false, status: 'error', error: '请求过于频繁' });
     const targetEmail = normalizeTargetEmail(req.body && req.body.targetEmail);
@@ -839,7 +936,7 @@ app.post('/api/otp/mark-baseline', async (req, res) => {
 });
 
 app.post('/api/otp/get', async (req, res) => {
-    const auth = requireLicenseSession(req, res);
+    const auth = await requireCompatibleLicenseSession(req, res);
     if (!auth) return;
     if (!allowOtpRequest(auth.rateLimitKey)) return res.status(429).json({ success: false, status: 'error', error: '请求过于频繁' });
     const targetEmail = normalizeTargetEmail(req.body && req.body.targetEmail);

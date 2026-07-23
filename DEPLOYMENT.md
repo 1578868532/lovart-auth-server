@@ -15,6 +15,9 @@ Set ALL of the following in Render → Environment (never commit real values to 
 | `OTP_IMAP_SECURE` | `true` | |
 | `OTP_IMAP_USE_PROXY` | `false` | Optional. Set to `true` only if the mail server must be reached through a proxy |
 | `OTP_IMAP_PROXY_SERVER` | empty | Optional. ImapFlow proxy URL, e.g. `socks5://host:port` or `http://host:port` |
+| `LOVART_NEW_AUTH_SERVER_URL` | `https://lovart-auth-server-new.onrender.com` | OTP verifies new sessions here before falling back to the legacy database |
+| `NEW_AUTH_VERIFY_TIMEOUT_MS` | `8000` | Timeout for new authorization verification |
+| `OTP_AUTH_CACHE_TTL_MS` | `60000` | Short compatibility cache to avoid repeated cross-service checks while polling |
 | `DATA_DIR` | persistent disk mount path | e.g. `/var/data`. `db.json` will be written here |
 
 **WARNING:** If `NODE_ENV` is not set to `production`, the server will start a local dev-only admin secret that must NOT be used in production. Always set `NODE_ENV=production` on Render.
@@ -27,6 +30,16 @@ Set ALL of the following in Render → Environment (never commit real values to 
 - **Start command:** `npm start`
 - **Health endpoint:** `GET /api/health` — returns `{ success: true }` when running
 - **Persistent disk:** Attach a Render Persistent Disk and set `DATA_DIR` to its mount directory (e.g. `/var/data`) so `db.json` survives restarts and deployments.
+
+### OTP authorization compatibility
+
+For cloud sessions, the legacy OTP endpoints verify authorization in this order:
+
+1. Call the new authorization service `/api/verify`.
+2. If that does not accept the session, validate it against the legacy local database.
+3. Reject the request only when both checks fail.
+
+Signed local LV2/LV3 mode continues to use local signature verification. Successful checks are cached briefly so one OTP polling cycle does not repeatedly call both backends.
 
 ## Desktop (Electron) setting
 
