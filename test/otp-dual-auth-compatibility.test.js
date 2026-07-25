@@ -22,7 +22,7 @@ async function post(baseUrl, route, body, headers = {}) {
   return { response, data: await response.json() };
 }
 
-test('legacy OTP accepts new auth first and falls back to the legacy database', async () => {
+test('OTP-only service accepts new auth and rejects legacy authorization routes and sessions', async () => {
   const verifyCalls = [];
   const newAuthServer = http.createServer((req, res) => {
     let raw = '';
@@ -42,6 +42,7 @@ test('legacy OTP accepts new auth first and falls back to the legacy database', 
   process.env.ADMIN_SECRET = 'test-admin-secret';
   process.env.LOVART_NEW_AUTH_SERVER_URL = `http://127.0.0.1:${newAuthServer.address().port}`;
   process.env.OTP_AUTH_CACHE_TTL_MS = '60000';
+  process.env.OTP_ONLY_MODE = 'true';
   delete process.env.NODE_ENV;
   delete process.env.DATABASE_URL;
   delete process.env.POSTGRES_URL;
@@ -76,21 +77,23 @@ test('legacy OTP accepts new auth first and falls back to the legacy database', 
       maxAccounts: 1,
       plan: 'monthly'
     }, { 'x-admin-secret': 'test-admin-secret' });
-    assert.equal(created.response.status, 200);
+    assert.equal(created.response.status, 410);
+    assert.equal(created.data.errorCode, 'LEGACY_AUTH_DISABLED');
 
     const activated = await post(baseUrl, '/api/activate', {
-      licenseKey: created.data.license.licenseKey,
+      licenseKey: 'LV-LEGACY-DISABLED',
       machineId: 'machine-legacy'
     });
-    assert.equal(activated.response.status, 200);
+    assert.equal(activated.response.status, 410);
+    assert.equal(activated.data.errorCode, 'LEGACY_AUTH_DISABLED');
 
     const legacySession = await post(baseUrl, '/api/otp/mark-baseline', { targetEmail: 'legacy@example.com' }, {
-      Authorization: `Bearer ${activated.data.sessionToken}`,
+      Authorization: 'Bearer legacy-session-token',
       'x-machine-id': 'machine-legacy'
     });
-    assert.equal(legacySession.response.status, 200);
-    assert.equal(legacySession.data.success, true);
-    assert.ok(verifyCalls.some(call => call.sessionToken === activated.data.sessionToken));
+    assert.equal(legacySession.response.status, 401);
+    assert.equal(legacySession.data.error, 'authorization_session_invalid');
+    assert.ok(verifyCalls.some(call => call.sessionToken === 'legacy-session-token'));
   } finally {
     await close(otpServer);
     await close(newAuthServer);

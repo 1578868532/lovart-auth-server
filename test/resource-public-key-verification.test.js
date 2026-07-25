@@ -6,6 +6,7 @@ const http = require('node:http');
 const { publicKey, privateKey } = crypto.generateKeyPairSync('ed25519');
 process.env.LOVART_LICENSE_PUBLIC_KEY = publicKey.export({ type: 'spki', format: 'pem' });
 process.env.LOVART_LICENSE_PRIVATE_KEY = 'invalid-signing-key';
+process.env.OTP_ONLY_MODE = 'false';
 delete process.env.DATABASE_URL;
 delete process.env.POSTGRES_URL;
 delete process.env.CHANNEL_DATABASE_URL;

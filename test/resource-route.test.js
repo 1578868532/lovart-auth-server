@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const http = require('node:http');
 
+process.env.OTP_ONLY_MODE = 'false';
 delete process.env.DATABASE_URL;
 delete process.env.POSTGRES_URL;
 delete process.env.CHANNEL_DATABASE_URL;

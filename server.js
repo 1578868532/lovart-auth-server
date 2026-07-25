@@ -8,6 +8,24 @@ const { simpleParser } = require('mailparser');
 const resourceApiHandler = require('./resource-service/api/index');
 
 const app = express();
+const OTP_ONLY_MODE = String(process.env.OTP_ONLY_MODE || 'true').toLowerCase() !== 'false';
+
+// The legacy Render service now exists only for mailbox OTP delivery.
+// Keep health/OTP routes available, but retire its authorization and resource APIs.
+app.use((req, res, next) => {
+    const allowed = req.method === 'OPTIONS'
+        || req.path === '/api/health'
+        || req.path === '/api/otp/status'
+        || req.path === '/api/otp/mark-baseline'
+        || req.path === '/api/otp/get';
+    if (!OTP_ONLY_MODE || allowed) return next();
+    return res.status(410).json({
+        success: false,
+        errorCode: 'LEGACY_AUTH_DISABLED',
+        message: '旧版授权服务已关闭，请使用新版授权服务'
+    });
+});
+
 // Resource/card API is hosted by the same Render service. Mount it before the
 // JSON parser because the original serverless handler reads the request stream.
 app.all(['/api', '/'], (req, res, next) => {
@@ -329,16 +347,6 @@ async function requireCompatibleLicenseSession(req, res) {
         console.warn('[OTP auth compatibility] new auth verification unavailable:', error.message);
     }
 
-    try {
-        const legacyAuth = getLicenseForSession(req);
-        if (!legacyAuth.error) {
-            cacheCompatibleAuth(sessionToken, machineId, 'legacy-auth');
-            return { ...legacyAuth, source: 'legacy-auth' };
-        }
-    } catch (error) {
-        console.warn('[OTP auth compatibility] legacy auth verification failed:', error.message);
-    }
-
     res.status(401).json({ success: false, error: 'authorization_session_invalid' });
     return null;
 }
@@ -605,7 +613,16 @@ app.use((req, res, next) => {
 });
 
 app.get('/api/health', (req, res) => {
-    res.json({ success: true, message: 'auth server running', buildSha: BUILD_SHA, otpCardAccessEnabled: true, resourceApiMounted: true, time: now() });
+    res.json({
+        success: true,
+        message: OTP_ONLY_MODE ? 'OTP service running; legacy authorization disabled' : 'auth server running',
+        mode: OTP_ONLY_MODE ? 'otp-only' : 'legacy-full',
+        legacyAuthEnabled: !OTP_ONLY_MODE,
+        buildSha: BUILD_SHA,
+        otpCardAccessEnabled: true,
+        resourceApiMounted: !OTP_ONLY_MODE,
+        time: now()
+    });
 });
 
 app.get('/api/otp/status', (req, res) => {

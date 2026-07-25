@@ -12,6 +12,7 @@ const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'lovart-auth-activation-')
 process.env.DATA_DIR = dataDir;
 process.env.LOVART_LICENSE_PUBLIC_KEY = publicKey.export({ type: 'spki', format: 'pem' });
 process.env.LOVART_LICENSE_PRIVATE_KEY = 'invalid-signing-key';
+process.env.OTP_ONLY_MODE = 'false';
 delete process.env.DATABASE_URL;
 delete process.env.POSTGRES_URL;
 delete process.env.CHANNEL_DATABASE_URL;
