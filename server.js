@@ -16,6 +16,8 @@ app.use((req, res, next) => {
     const allowed = req.method === 'OPTIONS'
         || req.path === '/api/health'
         || req.path === '/api/otp/status'
+        || req.path === '/api/activate'
+        || req.path === '/api/verify'
         || req.path === '/api/otp/mark-baseline'
         || req.path === '/api/otp/get';
     if (!OTP_ONLY_MODE || allowed) return next();
@@ -161,6 +163,36 @@ function createResourceLicenseRecord(authorization) {
 
 function createLicenseKey() {
     return `LV-${crypto.randomBytes(10).toString('hex').toUpperCase()}`;
+}
+
+const DEFAULT_DOLA_LICENSE_HASHES = '48ece37aa4e015ab7cd94809c68002fbd37fd4aabd6859eeff9f138ba6353880';
+const DOLA_LICENSE_HASHES = new Set(
+    String(process.env.DOLA_LICENSE_HASHES || DEFAULT_DOLA_LICENSE_HASHES)
+        .split(/[\s,]+/)
+        .map(value => value.trim().toLowerCase())
+        .filter(value => /^[a-f0-9]{64}$/.test(value))
+);
+
+function isDolaBootstrapLicense(licenseKey) {
+    const normalized = String(licenseKey || '').trim().toUpperCase();
+    if (!/^DOLA-(?:[A-F0-9]{8}-){3}[A-F0-9]{8}$/.test(normalized)) return false;
+    const digest = crypto.createHash('sha256').update(normalized).digest('hex');
+    return DOLA_LICENSE_HASHES.has(digest);
+}
+
+function createDolaLicenseRecord(licenseKey) {
+    return {
+        licenseKey: String(licenseKey || '').trim().toUpperCase(),
+        plan: 'dola-permanent',
+        expire_at: Date.UTC(2099, 11, 31, 23, 59, 59),
+        status: 'active',
+        bound_machine_id: null,
+        maxSlots: 1,
+        maxAccounts: 0,
+        durationDays: null,
+        created_at: now(),
+        source: 'dola-bootstrap'
+    };
 }
 
 const LICENSE_PRIVATE_KEY = process.env.LICENSE_PRIVATE_KEY
@@ -707,11 +739,19 @@ app.post('/api/activate', async (req, res) => {
     const licenseKey = String(req.body && req.body.licenseKey || '').trim();
     const machineId = String(req.body && req.body.machineId || '').trim();
     if (!licenseKey || !machineId) return res.status(400).json({ success: false, message: '缺少卡密或机器码' });
+    if (OTP_ONLY_MODE && !isDolaBootstrapLicense(licenseKey)) {
+        return res.status(410).json({ success: false, errorCode: 'LEGACY_AUTH_DISABLED', message: '旧版授权服务已关闭' });
+    }
 
     const db = loadDB();
     let license = db.licenses.find(item => item.licenseKey === licenseKey);
     if (license && license.status !== 'active') {
         return res.status(403).json({ success: false, message: '卡密已被封禁' });
+    }
+
+    if (!license && isDolaBootstrapLicense(licenseKey)) {
+        license = createDolaLicenseRecord(licenseKey);
+        db.licenses.push(license);
     }
 
     if (!license || license.source === 'resource-card') {
@@ -783,6 +823,9 @@ app.post('/api/verify', async (req, res) => {
         if (!session || session.machineId !== machineId) return res.status(401).json({ success: false, message: '授权会话无效' });
         const license = db.licenses.find(item => item.licenseKey === session.licenseKey);
         if (!license || license.status !== 'active') return res.status(403).json({ success: false, message: '授权已失效' });
+        if (OTP_ONLY_MODE && !String(license.plan || '').startsWith('dola')) {
+            return res.status(410).json({ success: false, errorCode: 'LEGACY_AUTH_DISABLED', message: '旧版授权服务已关闭' });
+        }
         if (license.source === 'resource-card') {
             const authorization = await verifyResourceIssuedLicense(license.licenseKey, machineId);
             if (!authorization.ok) {
